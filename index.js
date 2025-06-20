@@ -191,7 +191,13 @@ setInterval(() =>
   300_000);
 
 /*────────── 7 · Keep-alive HTTP server ──────────*/
-http.createServer((_, res) => res.end('Bot alive')).listen(process.env.PORT || 3000);
+const express = require('express');
+const app = express();
+
+app.get('/', (_, res) => res.send('OK'));  // Health-Check
+app.listen(process.env.PORT || 3000, () =>
+  console.log('🌐 HTTP keep-alive ready')
+);
 
 /*────────── 8 · Launch ──────────*/
 client.login(DISCORD_TOKEN);
