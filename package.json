@@ -1,12 +1,12 @@
 {
   "name": "monkey-linker",
   "version": "1.0.0",
-  "description": "Discord slash‑command bot to link Roblox accounts and fetch Monkey Simulator progress",
+  "description": "Discord slash-command bot to link Roblox accounts and fetch Monkey Simulator progress",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "deploy": "node deploy-commands.js",
-    "start": "node index.js",
+    "start": "node index.js"
   },
   "dependencies": {
     "axios": "^1.6.7",
