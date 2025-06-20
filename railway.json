@@ -1,0 +1,8 @@
+{
+  "services": {
+    "bot": {
+      "command": "npm start",
+      "healthcheck": "skip"
+    }
+  }
+}
