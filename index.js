@@ -206,6 +206,8 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('🌐 HTTP keep-alive on', PORT));
 
 // Dummy interval – hält Event-Loop garantiert offen
-setInterval(() => {}, 60_000);
+setInterval(() => {
+  console.log('⏳ still alive');
+}, 60_000);
 /*────────── 8 · Launch ──────────*/
 client.login(DISCORD_TOKEN);
