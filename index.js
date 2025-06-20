@@ -93,7 +93,12 @@ async function getUserId(username) {
 client.on('interactionCreate', async (i) => {
   if (!i.isChatInputCommand() || i.commandName !== 'connect') return;
   const rbxName = i.options.getString('robloxuser', true);
-  await i.deferReply({ ephemeral: true });
+  try {
+    await i.deferReply({ flags: 1 << 6 });
+  } catch (err) {
+    console.error('❌ deferReply failed:', err);
+    return;
+  }
 
   /* 4.1   Roblox lookup (new API) */
   let userId;
