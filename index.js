@@ -199,5 +199,7 @@ app.listen(process.env.PORT || 3000, () =>
   console.log('🌐 HTTP keep-alive ready')
 );
 
+// Dummy interval – hält Event-Loop garantiert offen
+setInterval(() => {}, 60_000);
 /*────────── 8 · Launch ──────────*/
 client.login(DISCORD_TOKEN);
