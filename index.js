@@ -1,33 +1,25 @@
-// index.js – Monkey Linker Bot (modular commands)
-// ------------------------------------------------------
-// • /connect, /progress, /unlink via commands/
-// • SQLite cache, role-grant, Open Cloud progress optional
-// • Keeps Railway/Fly/Render alive via express
-// ------------------------------------------------------
+// index.js – Monkey Linker Bot (modular final version)
+// --------------------------------------------
+// • Loads slash commands from ./commands
+// • Manages verified links via SQLite
+// • Keeps Railway/Fly/Render alive via HTTP server
+// • Auto-registers all commands on boot
 
 require('dotenv').config();
-const fs = require('fs');
-const path = require('path');
+const fs = require('node:fs');
+const path = require('node:path');
 const express = require('express');
 const sqlite = require('sqlite3').verbose();
-const {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  Collection,
-  REST,
-  Routes
-} = require('discord.js');
+const { Client, GatewayIntentBits, Collection, REST, Routes, Partials } = require('discord.js');
 
-/*────────── 0 · ENV ──────────*/
+/*────────── 1 · ENV ──────────*/
 const {
   DISCORD_TOKEN,
   CLIENT_ID,
   GUILD_ID
 } = process.env;
 
-/*────────── 1 · Slash-command loading ──────────*/
-const commands = [];
+/*────────── 2 · Discord client ──────────*/
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -37,32 +29,37 @@ const client = new Client({
     GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.DirectMessageReactions
   ],
-  partials: [Partials.Channel]
+  partials: [Partials.Channel, Partials.Message, Partials.Reaction]
 });
 
 client.commands = new Collection();
-const cmdFiles = fs.readdirSync('./commands').filter(f => f.endsWith('.js'));
+
+/*────────── 3 · Load all commands ──────────*/
+const commands = [];
+const cmdsPath = path.join(__dirname, 'commands');
+const cmdFiles = fs.readdirSync(cmdsPath).filter(file => file.endsWith('.js'));
+
 for (const file of cmdFiles) {
-  const command = require(`./commands/${file}`);
-  client.commands.set(command.data.name, command);
-  commands.push(command.data.toJSON());
+  const cmd = require(`./commands/${file}`);
+  client.commands.set(cmd.data.name, cmd);
+  commands.push(cmd.data.toJSON());
 }
 
-/*────────── 2 · Register slash commands ──────────*/
-client.once('ready', async () => {
-  console.log(`🤖 Logged in as ${client.user.tag}`);
-  const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+/*────────── 4 · Register slash commands ──────────*/
+const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+
+async function registerCommands() {
   try {
     await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
     console.log('✅ Slash commands registered');
   } catch (err) {
-    console.error('❌ Command register error:', err);
+    console.error(err);
   }
-});
+}
 
-/*────────── 3 · SQLite DB ──────────*/
-const db = new sqlite.Database('./links.db');
-db.exec(`
+/*────────── 5 · SQLite ──────────*/
+client.db = new sqlite.Database('./links.db');
+client.db.exec(`
   CREATE TABLE IF NOT EXISTS links (
     discord  TEXT PRIMARY KEY,
     roblox   INTEGER UNIQUE NOT NULL,
@@ -71,31 +68,36 @@ db.exec(`
     created  INTEGER DEFAULT (strftime('%s','now'))
   )
 `);
-client.db = db;
 
-/*────────── 4 · Interaction handling ──────────*/
+/*────────── 6 · Command interaction handler ──────────*/
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
+
   const command = client.commands.get(interaction.commandName);
   if (!command) return;
+
   try {
     await command.execute(interaction, client);
-  } catch (err) {
-    console.error(err);
-    if (interaction.replied || interaction.deferred) {
-      await interaction.editReply({ content: '❌ Error executing command.' });
-    } else {
-      await interaction.reply({ content: '❌ Error executing command.', ephemeral: true });
-    }
+  } catch (error) {
+    console.error(error);
+    interaction.reply({ content: '❌ Something went wrong.', ephemeral: true });
   }
 });
 
-/*────────── 5 · Keep-alive HTTP server ──────────*/
+/*────────── 7 · Keep-alive server ──────────*/
 const app = express();
 app.get('/', (_, res) => res.send('OK'));
 app.get('/healthz', (_, res) => res.send('OK'));
-app.listen(process.env.PORT || 3000, () => console.log('🌐 HTTP keep-alive ready'));
-setInterval(() => console.log('⏳ still alive'), 60_000);
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('🌐 HTTP keep-alive on', PORT));
 
-/*────────── 6 · Launch bot ──────────*/
+/*────────── 8 · Launch ──────────*/
+client.once('ready', async () => {
+  console.log(`🤖 Logged in as ${client.user.tag}`);
+  await registerCommands();
+});
+
 client.login(DISCORD_TOKEN);
+
+// Dummy interval for event-loop hold
+setInterval(() => console.log('⏳ still alive'), 60_000);
