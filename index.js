@@ -194,10 +194,11 @@ setInterval(() =>
 const express = require('express');
 const app = express();
 
-app.get('/', (_, res) => res.send('OK'));  // Health-Check
-app.listen(process.env.PORT || 3000, () =>
-  console.log('🌐 HTTP keep-alive ready')
-);
+app.get('/', (_, res) => res.send('OK'));
+app.get('/healthz', (_, res) => res.send('OK'));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('🌐 HTTP keep-alive on', PORT));
 
 // Dummy interval – hält Event-Loop garantiert offen
 setInterval(() => {}, 60_000);
