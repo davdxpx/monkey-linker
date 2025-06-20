@@ -14,5 +14,4 @@
     "dotenv": "^16.4.5",
     "sqlite3": "^5.1.4"
   }
-  "postinstall": "node deploy-commands.js"
 }
