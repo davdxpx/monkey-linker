@@ -1,25 +1,66 @@
-// Monkey Linker Bot – links a Discord user to their Roblox account via profile‑code method
+// index.js – Monkey Linker Bot (all-in-one)
+// Links a Discord user to their Roblox account via profile-code method
+// Keeps Railway (or any PaaS) alive with a tiny HTTP server
+// Auto-registers /connect each time the bot boots
+
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, EmbedBuilder } = require('discord.js');
-const axios = require('axios');
-const sqlite = require('sqlite3').verbose();
-const crypto = require('crypto');
+const {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  EmbedBuilder,
+  REST,
+  Routes
+} = require('discord.js');
+const axios   = require('axios');
+const sqlite  = require('sqlite3').verbose();
+const crypto  = require('crypto');
+const http    = require('http');
 
-/***************************
- *  0 · Database setup      *
- ***************************/
+/*────────── 0 · ENV & constants ──────────*/
+const {
+  DISCORD_TOKEN,
+  CLIENT_ID,
+  GUILD_ID,
+  VERIFIED_ROLE_ID,  // optional: role granted after link
+  UNIVERSE_ID,       // optional: for progress fetch
+  OC_KEY             // optional: Open Cloud API key
+} = process.env;
+
+/*────────── 1 · Slash-command register (guild scoped) ──────────*/
+async function registerSlash() {
+  const cmd = [{
+    name: 'connect',
+    description: 'Link your Roblox account',
+    options: [{
+      name: 'robloxuser',
+      description: 'Exact Roblox username (case-sensitive)',
+      type: 3,
+      required: true
+    }]
+  }];
+
+  const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+  await rest.put(
+    Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
+    { body: cmd }
+  );
+  console.log('✅ Slash command registered');
+}
+
+/*────────── 2 · SQLite setup ──────────*/
 const db = new sqlite.Database('./links.db');
-db.exec(`CREATE TABLE IF NOT EXISTS links (
-  discord TEXT PRIMARY KEY,
-  roblox  INTEGER UNIQUE NOT NULL,
-  code    TEXT,
-  verified INTEGER DEFAULT 0,
-  created  INTEGER DEFAULT (strftime('%s','now'))
-)`);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS links (
+    discord   TEXT PRIMARY KEY,
+    roblox    INTEGER UNIQUE NOT NULL,
+    code      TEXT,
+    verified  INTEGER DEFAULT 0,
+    created   INTEGER DEFAULT (strftime('%s','now'))
+  )
+`);
 
-/***************************
- *  1 · Discord client      *
- ***************************/
+/*────────── 3 · Discord client ──────────*/
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -27,89 +68,112 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages
   ],
-  partials: [Partials.Channel] // allow DM handling
+  partials: [Partials.Channel] // enable DM messages
 });
 
-client.once('ready', () => console.log(`🤖 Logged in as ${client.user.tag}`));
+client.once('ready', async () => {
+  console.log(`🤖 Logged in as ${client.user.tag}`);
+  try { await registerSlash(); } catch (e) { console.error(e); }
+});
 
-/***************************
- *  2 · /CONNECT handler    *
- ***************************/
-client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand() || interaction.commandName !== 'connect') return;
-  const rbxName = interaction.options.getString('robloxuser', true);
-  await interaction.deferReply({ ephemeral: true });
+/*────────── 4 · /connect handler ──────────*/
+client.on('interactionCreate', async (i) => {
+  if (!i.isChatInputCommand() || i.commandName !== 'connect') return;
 
-  // 2.1 Resolve userId via Roblox API
-  const res = await axios.get(`https://api.roblox.com/users/get-by-username?username=${encodeURIComponent(rbxName)}`);
-  if (!res.data.Id) return interaction.editReply('🚫 Roblox user not found. Check spelling & try again.');
+  const rbxName = i.options.getString('robloxuser', true);
+  await i.deferReply({ ephemeral: true });
 
-  const userId = res.data.Id;
+  /* 4.1 Roblox lookup */
+  const lookup = await axios.get(
+    `https://api.roblox.com/users/get-by-username?username=${encodeURIComponent(rbxName)}`
+  );
+  if (!lookup.data.Id) return i.editReply('🚫 Roblox user not found.');
 
-  // 2.2 Generate link code & store pending row
+  const userId = lookup.data.Id;
+
+  /* 4.2 Duplicate check / rate-limit (pending exists) */
+  const pending = await new Promise(r =>
+    db.get('SELECT verified FROM links WHERE discord=?', [i.user.id], (_, row) => r(row))
+  );
+  if (pending && !pending.verified)
+    return i.editReply('⚠️ You already have a pending link. Finish that first.');
+
+  /* 4.3 Generate code & store */
   const code = crypto.randomBytes(3).toString('hex').toUpperCase();
-  db.run('INSERT OR REPLACE INTO links (discord, roblox, code, verified) VALUES (?,?,?,0)',
-    [interaction.user.id, userId, code]);
+  db.run('INSERT OR REPLACE INTO links (discord, roblox, code, verified, created) VALUES (?,?,?,?,strftime("%s","now"))',
+    [i.user.id, userId, code, 0]);
 
-  // 2.3  DM instructions to user
-  const dmEmbed = new EmbedBuilder()
+  /* 4.4 Send DM */
+  const embed = new EmbedBuilder()
     .setColor(0x00bcd4)
     .setTitle('Account Link – Final Step')
     .setDescription(
-      `Paste this code **exactly** in your Roblox profile About section, save, then react ✅ here within 15 min:\n\n`+
-      `\`${code}\`\n\nYou can delete it after verification.`)
+      `1️⃣ Paste **${code}** into your **Roblox profile About section**.\n` +
+      '2️⃣ Return to this DM and press ✅ within 15 minutes.\n\n' +
+      '_You can remove the code after verification._'
+    )
     .setFooter({ text: 'StillBroke Studios • Monkey Simulator' });
 
-  const dm = await interaction.user.send({ embeds: [dmEmbed] });
+  const dm = await i.user.send({ embeds: [embed] });
   await dm.react('✅');
-  await interaction.editReply('📩 Check your DMs for instructions!');
+
+  i.editReply('📩 Check your DMs for the verification code!');
 });
 
-/***************************
- *  3 · Reaction checker     *
- ***************************/
+/*────────── 5 · Reaction-handler (verify) ──────────*/
 client.on('messageReactionAdd', async (reaction, user) => {
   if (user.bot || reaction.emoji.name !== '✅') return;
-  // Ensure full message for partials
   if (reaction.partial) await reaction.fetch();
 
-  db.get('SELECT * FROM links WHERE discord = ?', [user.id], async (err, row) => {
-    if (err || !row || row.verified) return;
+  db.get('SELECT * FROM links WHERE discord=?', [user.id], async (_, row) => {
+    if (!row || row.verified) return; // nothing pending
 
     try {
       const profile = await axios.get(`https://users.roblox.com/v1/users/${row.roblox}`);
-      if (!profile.data.description || !profile.data.description.includes(row.code)) {
-        return user.send('❌ Code not found on your profile. Make sure it is saved and visible, then react again.');
+      if (!profile.data.description?.includes(row.code))
+        return user.send('❌ Code not found on profile. Save it and react again.');
+
+      /* Mark verified */
+      db.run('UPDATE links SET verified=1 WHERE discord=?', [user.id]);
+      user.send('✅ Linked! You may delete the code from your profile.');
+
+      /* Optional role grant */
+      if (VERIFIED_ROLE_ID) {
+        const guild  = await client.guilds.fetch(GUILD_ID);
+        const member = await guild.members.fetch(user.id).catch(()=>null);
+        if (member) member.roles.add(VERIFIED_ROLE_ID).catch(console.error);
       }
 
-      // Mark verified & clear code
-      db.run('UPDATE links SET verified = 1 WHERE discord = ?', [user.id]);
-      user.send('✅ Linked! You can now remove the code from your profile.');
-
-      /* OPTIONAL: fetch progress from Open Cloud
-      if (process.env.UNIVERSE_ID && process.env.OC_KEY) {
+      /* Optional progress fetch */
+      if (UNIVERSE_ID && OC_KEY) {
         const entryKey = `Player_${row.roblox}`;
-        const resp = await axios.get(
-          `https://apis.roblox.com/datastores/v1/universes/${process.env.UNIVERSE_ID}/standard-datastores/datastore/entries/entry`,
+        const oc = await axios.get(
+          `https://apis.roblox.com/datastores/v1/universes/${UNIVERSE_ID}/standard-datastores/datastore/entries/entry`,
           {
             params: { datastoreName: 'MainDataStore', entryKey },
-            headers: { 'x-api-key': process.env.OC_KEY }
+            headers: { 'x-api-key': OC_KEY }
           }
         );
-        const data = JSON.parse(resp.data.data);
+        const data  = JSON.parse(oc.data.data);
         const level = data?.PlayerData?.Progress?.Level ?? 'N/A';
-        user.send(`📊 Current Monkey level: **${level}**`);
+        const stats = data?.PlayerData?.Progress?.Statues ?? 'N/A';
+        user.send(`📊 Monkey Level **${level}** · Statues **${stats}/42**`);
       }
-      */
 
     } catch (e) {
       console.error(e);
-      user.send('⚠️ Something went wrong. Try again later.');
+      user.send('⚠️ Verification failed, try again later.');
     }
   });
 });
 
-/***************************
- *  4 · Start the bot        *
- ***************************/
-client.login(process.env.DISCORD_TOKEN);
+/*────────── 6 · House-keeping: delete stale pending rows (15 min+) ──────────*/
+setInterval(() =>
+  db.run('DELETE FROM links WHERE verified=0 AND (strftime("%s","now")-created) > 900'),
+  300_000);
+
+/*────────── 7 · Keep-alive HTTP server (for Railway web service) ──────────*/
+http.createServer((_, res) => res.end('Linker alive')).listen(process.env.PORT || 3000);
+
+/*────────── 8 · Launch ──────────*/
+client.login(DISCORD_TOKEN);
