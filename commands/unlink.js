@@ -1,30 +1,53 @@
-// commands/unlink.js – Remove linked Roblox account
-// 🐒 Discord ↔ Roblox unlink command
+// commands/unlink.js – Unlink your Roblox account (final)
+// 🐒 Removes database entry, role, and sends confirmation embed
 // © StillBrokeStudios 2025 · @davdxpx
 
-const { SlashCommandBuilder } = require('discord.js');
+const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 
 module.exports = {
   data: new SlashCommandBuilder()
     .setName('unlink')
-    .setDescription('Unlink your currently connected Roblox account'),
+    .setDescription('Completely remove your linked Roblox account'),
 
-  async execute(interaction, db, config) {
+  async execute(interaction, db, cfg) {
     await interaction.deferReply({ ephemeral: true });
 
-    const row = await new Promise(r =>
-      db.get('SELECT * FROM links WHERE discord=?', [interaction.user.id], (_, row) => r(row))
-    );
-    if (!row) return interaction.editReply('🚫 You have no linked account.');
+    db.get('SELECT * FROM links WHERE discord = ? AND verified = 1', [interaction.user.id], (err, row) => {
+      if (err) {
+        console.error(err);
+        return interaction.editReply('❌ Database error. Try again later.');
+      }
 
-    db.run('DELETE FROM links WHERE discord=?', [interaction.user.id]);
+      if (!row) {
+        return interaction.editReply('🚫 No verified link found for your account.');
+      }
 
-    if (config.VERIFIED_ROLE_ID) {
-      const guild  = await interaction.client.guilds.fetch(config.GUILD_ID);
-      const member = await guild.members.fetch(interaction.user.id).catch(() => null);
-      if (member) member.roles.remove(config.VERIFIED_ROLE_ID).catch(console.error);
-    }
+      // Delete the DB row
+      db.run('DELETE FROM links WHERE discord = ?', [interaction.user.id], async err => {
+        if (err) {
+          console.error(err);
+          return interaction.editReply('❌ Could not unlink due to an internal error.');
+        }
 
-    interaction.editReply('✅ Your Roblox account has been unlinked.');
+        // Remove Verified role if set
+        if (cfg.VERIFIED_ROLE_ID) {
+          try {
+            const guild = await interaction.client.guilds.fetch(cfg.GUILD_ID);
+            const member = await guild.members.fetch(interaction.user.id);
+            await member.roles.remove(cfg.VERIFIED_ROLE_ID);
+          } catch (e) {
+            console.error('Role removal failed:', e);
+          }
+        }
+
+        const embed = new EmbedBuilder()
+          .setColor(0xe53935)
+          .setTitle('🔗 Link removed')
+          .setDescription('Your Discord account is no longer connected to Roblox.')
+          .setFooter({ text: 'You can /connect again any time.' });
+
+        interaction.editReply({ embeds: [embed] });
+      });
+    });
   }
 };
