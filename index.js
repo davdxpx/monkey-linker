@@ -140,6 +140,7 @@ client.on('interactionCreate', async (i) => {
 
 /*────────── 5 · Reaction-verification ──────────*/
 client.on('messageReactionAdd', async (reaction, user) => {
+  console.log('➡️ Reaction received from', user.tag);
   if (user.bot || reaction.emoji.name !== '✅') return;
   if (reaction.partial) await reaction.fetch();
 
