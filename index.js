@@ -215,21 +215,19 @@ process.on('unhandledRejection', err => console.error('💥 Unhandled promise re
 process.on('uncaughtException',  err => console.error('💥 Uncaught exception', err));
 
 // ─────────────────────────────  BOOT  ────────────────────────────────
-(async () => {
-  try {
-    const commandList = loadCommands();
-    await registerCommands(commandList);
-    await client.login(DISCORD_TOKEN);
-  } catch (err) {
-    console.error('Fatal startup error', err);
-    process.exit(1);
-  }
-})();
+const commandList = loadCommands();
 
-/*────────── 7 · Boot ──────────*/
 client.once('ready', async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
-  await registerCommands();
+  try {
+    await registerCommands(commandList);
+    log('Slash commands sync completed');
+  } catch (err) {
+    console.error('Failed to register slash commands', err);
+  }
 });
 
-client.login(DISCORD_TOKEN);
+client.login(DISCORD_TOKEN).catch(err => {
+  console.error('Login error', err);
+  process.exit(1);
+});
