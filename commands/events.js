@@ -31,15 +31,15 @@ module.exports = {
     // /events create ...
     .addSubcommand(sc => sc.setName('create').setDescription('Create a new event')
       .addStringOption(o => o.setName('title').setDescription('Event title').setRequired(true))
-      .addStringOption(o => o.setName('date').setDescription('Date (YYYY‑MM‑DD)').setRequired(true))
-      .addStringOption(o => o.setName('time').setDescription('Start time (e.g. 18:00 UTC)').setRequired(false))
-      .addStringOption(o => o.setName('desc').setDescription('Short description').setRequired(true))
-      .addStringOption(o => o.setName('world').setDescription('Which game world / island?').setRequired(false))
-      .addStringOption(o => o.setName('area').setDescription('Specific area / zone').setRequired(false))
-      .addStringOption(o => o.setName('reward').setDescription('Reward overview').setRequired(false))
-      .addRoleOption(  o => o.setName('pingrole').setDescription('Role to ping when announcing').setRequired(false))
-      .addIntegerOption(o => o.setName('capacity').setDescription('Max participants (0 = unlimited)').setRequired(false)))
-
+      .addStringOption(o => o.setName('date').setDescription('Date (YYYY-MM-DD)').setRequired(true))
+      .addStringOption(o => o.setName('desc').setDescription('Short description').setRequired(true))   // ← nach oben!
+      // ab hier NUR noch optionale Felder
+      .addStringOption(o => o.setName('time').setDescription('Start time (e.g. 18:00 UTC)'))
+      .addStringOption(o => o.setName('world').setDescription('Which game world / island?'))
+      .addStringOption(o => o.setName('area').setDescription('Specific area / zone'))
+      .addStringOption(o => o.setName('reward').setDescription('Reward overview'))
+      .addRoleOption(  o => o.setName('pingrole').setDescription('Role to ping when announcing'))
+      .addIntegerOption(o => o.setName('capacity').setDescription('Max participants (0 = unlimited)')))
     // /events delete <id>
     .addSubcommand(sc => sc.setName('delete').setDescription('Delete an event by its ID')
       .addIntegerOption(o => o.setName('id').setDescription('ID from /events list').setRequired(true))),
