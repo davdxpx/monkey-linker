@@ -149,8 +149,9 @@ function loadCommands() {
   const files = fs.readdirSync('./commands').filter(f => f.endsWith('.js'));
   const list = [];
   for (const f of files) {
-    delete require.cache[require.resolve(path.join('./commands', f))];
-    const cmd = require(path.join('./commands', f));
+    const filePath = path.join(__dirname, 'commands', f);
+    delete require.cache[require.resolve(filePath)];
+    const cmd = require(filePath);
     if (!cmd?.data || !cmd?.execute) { warn('Invalid command', f); continue; }
     client.commands.set(cmd.data.name, cmd);
     list.push(cmd.data.toJSON());
