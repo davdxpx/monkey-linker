@@ -1,31 +1,43 @@
 // ╔═══════════════════════════════════════════════════════════════════╗
-// ║  index.js – Monkey Linker Bot  v3                                ║
-// ║  Discord ⇆ Roblox linking with pluggable DB backend:             ║
-// ║     • SQLite  (default, single‑file)                             ║
-// ║     • MongoDB (up to 4 clusters, see db/mongo.js)                ║
-// ║  Slash‑command autoloader, OpenCloud lookup, keep‑alive HTTP.    ║
-// ║                                                                  ║
-// ║  © StillBrokeStudios 2025 • Author @davdxpx                       ║
+// ║  index.js – Monkey Linker Bot · FINAL                            ║
+// ║  Discord ⇆ Roblox account linking & event commands               ║
+// ║                                                                 ║
+// ║  ▸ Dual DB‑Backend                                               ║
+// ║      • SQLite  (zero‑config fallback)                            ║
+// ║      • MongoDB (multi‑cluster, see db/mongo.js)                  ║
+// ║  ▸ Slash‑command autoloader & hot‑reload                         ║
+// ║  ▸ Robust interaction & reaction verification flow               ║
+// ║  ▸ Optional Roblox OpenCloud stats DM                            ║
+// ║  ▸ Express keep‑alive + /healthz + /stats                        ║
+// ║                                                                 ║
+// ║  © StillBrokeStudios 2025 – Author @davdxpx                      ║
 // ╚═══════════════════════════════════════════════════════════════════╝
 
-// ─────────────────────────────── CONFIG ─────────────────────────────
+// ───────────────────────────── CONFIG ─────────────────────────────
 require('dotenv').config();
 const {
   DISCORD_TOKEN,
   CLIENT_ID,
   GUILD_ID,
   VERIFIED_ROLE_ID,
-  ADMIN_ROLES          = '',
+  ADMIN_ROLES          = '',              // comma‑separated names or IDs
+
   // DB selection
   DB_PATH              = './links.db',
   MONGO_DB_NAME,
   MONGO_URI_1,
+  MONGO_URI_2,
+  MONGO_URI_3,
+  MONGO_URI_4,
+
   // Roblox OpenCloud (optional)
   UNIVERSE_ID,
   OC_KEY,
+
   // Runtime / Hosting
   PORT                 = 8080,
   KEEPALIVE_URL,
+
   // Debug flags
   DEBUG_LINKER         = '0',
   DEBUG_MONGO          = '0',
@@ -69,6 +81,12 @@ client.cooldowns = new Collection();
 // ──────────────────────── DB BACKEND SELECTION ──────────────────────
 let linkStore; // unified CRUD interface used throughout the bot
 
+function wrapSql(db) {
+  const get = (q, p=[]) => new Promise((res, rej) => db.get(q, p, (e,r)=>e?rej(e):res(r)));
+  const run = (q, p=[]) => new Promise((res, rej) => db.run(q, p, e=>e?rej(e):res()));
+  return { get, run };
+}
+
 async function initSqlite() {
   return new Promise((resolve, reject) => {
     const db = new sqlite3.Database(DB_PATH, err => {
@@ -79,29 +97,26 @@ async function initSqlite() {
       discord   TEXT    PRIMARY KEY,
       roblox    INTEGER UNIQUE NOT NULL,
       code      TEXT,
+      attempts  INTEGER DEFAULT 0,
       verified  INTEGER DEFAULT 0,
       created   INTEGER DEFAULT (strftime('%s','now'))
     )`, err => err && warn('DB init error', err));
 
-    const wrap = sql => new Promise((res, rej) => {
-      db.get(sql.query, sql.params, (e, r) => (e ? rej(e) : res(r)));
-    });
-    const run  = sql => new Promise((res, rej) => {
-      db.run(sql.query, sql.params, e => (e ? rej(e) : res()));
-    });
+    const sql = wrapSql(db);
 
     const api = {
-      get:        discord => wrap({ query: 'SELECT * FROM links WHERE discord=?', params: [discord] }),
-      getByRb:    roblox  => wrap({ query: 'SELECT * FROM links WHERE roblox=?',  params: [roblox] }),
-      upsertLink: ({ discord, roblox, code }) => run({
-        query: 'INSERT OR REPLACE INTO links (discord, roblox, code, verified, created) VALUES (?,?,?,?,strftime("%s","now"))',
-        params: [discord, roblox, code, 0],
-      }),
-      verify:     discord => run({ query: 'UPDATE links SET verified=1 WHERE discord=?', params: [discord] }),
-      cleanupExpired: seconds => run({
-        query: 'DELETE FROM links WHERE verified=0 AND (strftime("%s","now")-created) > ?',
-        params: [seconds],
-      }),
+      get:        discord => sql.get('SELECT * FROM links WHERE discord=?', [discord]),
+      getByRb:    roblox  => sql.get('SELECT * FROM links WHERE roblox=?',  [roblox]),
+      upsertLink: ({ discord, roblox, code, attempts=0 }) => sql.run(
+        'INSERT OR REPLACE INTO links (discord, roblox, code, attempts, verified, created) VALUES (?,?,?,?,0,strftime("%s","now"))',
+        [discord, roblox, code, attempts],
+      ),
+      setAttempts: (discord, attempts) => sql.run('UPDATE links SET attempts=? WHERE discord=?', [attempts, discord]),
+      verify:     discord => sql.run('UPDATE links SET verified=1 WHERE discord=?', [discord]),
+      cleanupExpired: seconds => sql.run(
+        'DELETE FROM links WHERE verified=0 AND (strftime("%s","now")-created) > ?',
+        [seconds],
+      ),
     };
 
     // periodic cleanup (15 min default)
@@ -112,7 +127,11 @@ async function initSqlite() {
 
 async function initMongoBackend() {
   const { initMongo } = require('./db/mongo');
-  const mongo = await initMongo();
+  const mongo = await initMongo({
+    MONGO_DB_NAME,
+    MONGO_URI_1, MONGO_URI_2, MONGO_URI_3, MONGO_URI_4,
+    debug: DEBUG_MONGO === '1',
+  });
   return mongo.links; // links API exposed by db/mongo.js
 }
 
@@ -132,7 +151,7 @@ function loadCommands() {
   const files = fs.readdirSync(dir).filter(f => f.endsWith('.js'));
   const list = [];
   for (const f of files) {
-    delete require.cache[require.resolve(path.join(dir, f))];
+    delete require.cache[require.resolve(path.join(dir, f))]; // hot‑reload support
     const cmd = require(path.join(dir, f));
     if (!cmd?.data || !cmd?.execute) {
       warn(`Skipping invalid command file ${f}`);
@@ -151,7 +170,7 @@ async function registerCommands(list) {
     ? Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID)
     : Routes.applicationCommands(CLIENT_ID);
   await rest.put(route, { body: list });
-  console.log(`✅ Registered ${list.length} slash commands`);
+  console.log(`✅ Registered ${list.length} slash commands ${GUILD_ID ? 'in guild' : 'globally'}`);
 }
 
 // ────────────────────────── INTERACTIONS ────────────────────────────
@@ -160,6 +179,7 @@ client.on('interactionCreate', async interaction => {
   const cmd = client.commands.get(interaction.commandName);
   if (!cmd) return;
 
+  // per‑command / per‑user cooldown
   const key = `${interaction.user.id}:${cmd.data.name}`;
   const now = Date.now();
   const cooldown = client.cooldowns.get(key);
@@ -177,9 +197,9 @@ client.on('interactionCreate', async interaction => {
     });
   } catch (err) {
     console.error('❌ Command error', err);
-    (interaction.replied || interaction.deferred
-      ? interaction.followUp
-      : interaction.reply).call(interaction, { content: '⚠️ Internal error occurred.', ephemeral: true });
+    const fn = (interaction.replied || interaction.deferred) ? interaction.followUp.bind(interaction)
+                                                            : interaction.reply.bind(interaction);
+    fn({ content: '⚠️ Internal error occurred.', ephemeral: true }).catch(()=>{});
   }
 });
 
@@ -205,16 +225,19 @@ client.on('messageReactionAdd', async (reaction, user) => {
       member?.roles.add(VERIFIED_ROLE_ID).catch(console.error);
     }
 
-    // Optional OpenCloud stats
+    // Optional OpenCloud stats DM
     if (UNIVERSE_ID && OC_KEY) {
       try {
         const entryKey = `Player_${row.roblox}`;
         const { data } = await axios.get(
           `https://apis.roblox.com/datastores/v1/universes/${UNIVERSE_ID}/standard-datastores/datastore/entries/entry`,
-          { params: { datastoreName: 'MainDataStore', entryKey }, headers: { 'x-api-key': OC_KEY } },
+          {
+            params: { datastoreName: 'MainDataStore', entryKey },
+            headers: { 'x-api-key': OC_KEY },
+          },
         );
         const json = JSON.parse(data?.data ?? '{}');
-        const lvl = json?.PlayerData?.Progress?.Level ?? '?';
+        const lvl = json?.PlayerData?.Progress?.Level   ?? '?';
         const sts = json?.PlayerData?.Progress?.Statues ?? '?';
         await user.send(`📊 Monkey Level **${lvl}** · Statues **${sts}/42**`);
       } catch (e) {
@@ -229,8 +252,8 @@ client.on('messageReactionAdd', async (reaction, user) => {
 
 // ───────────────────────────── EXPRESS ─────────────────────────────
 const app = express();
-app.get('/',    (_, res) => res.send('OK'));
-app.get('/healthz', (_, res) => res.json({ ok: true, ts: Date.now() }));
+app.get('/',       (_, res) => res.send('OK'));
+app.get('/healthz',(_, res) => res.json({ ok: true, ts: Date.now() }));
 app.get('/stats',  (_, res) => {
   const m = process.memoryUsage();
   res.json({ rss: m.rss, heap: m.heapUsed, uptime: process.uptime() });
@@ -241,14 +264,14 @@ if (KEEPALIVE_URL) setInterval(() => axios.get(KEEPALIVE_URL).catch(()=>{}), 5 *
 
 // ─────────────────── GLOBAL ERROR HANDLERS ─────────────────────────
 process.on('unhandledRejection', err => console.error('💥 Unhandled promise rejection', err));
-process.on('uncaughtException',  err => console.error('💥 Uncaught exception', err));
+process.on('uncaughtException' , err => console.error('💥 Uncaught exception', err));
 
 // ─────────────────────────── BOOTSTRAP ────────────────────────────
 (async () => {
   try {
     linkStore = await selectBackend();
-
     const commandList = loadCommands();
+
     client.once('ready', async () => {
       console.log(`🤖 Logged in as ${client.user.tag}`);
       try { await registerCommands(commandList); }
@@ -261,4 +284,3 @@ process.on('uncaughtException',  err => console.error('💥 Uncaught exception',
     process.exit(1);
   }
 })();
-        
