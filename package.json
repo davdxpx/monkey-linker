@@ -1,18 +1,39 @@
 {
-  "name": "monkey-simulator-helper",
-  "version": "1.0.0",
+  "name": "monkey-linker-bot",
+  "version": "1.1.0",
   "description": "Discord slash-command bot to link Roblox accounts and fetch Monkey Simulator progress",
   "main": "index.js",
   "type": "commonjs",
+
   "scripts": {
     "deploy": "node deploy-commands.js",
-    "start": "node index.js"
+    "start":  "node index.js",
+    "dev":    "nodemon index.js"
   },
+
   "dependencies": {
     "axios": "^1.6.7",
     "discord.js": "^14.14.1",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "mongodb": "^5.10.0",
     "sqlite3": "^5.1.4"
-  }
+  },
+
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+
+  "engines": {
+    "node": ">=18.0.0"
+  },
+
+  "keywords": [
+    "discord",
+    "roblox",
+    "opencloud",
+    "slash-commands"
+  ],
+  "author": "StillBrokeStudios © 2025 · @davdxpx",
+  "license": "MIT"
 }
