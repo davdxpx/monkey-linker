@@ -265,22 +265,30 @@ process.on('unhandledRejection', e => console.error('UnhandledRejection', e));
 process.on('uncaughtException' , e => console.error('UncaughtException', e));
 
 //-------------------------------------------------------------------
-// 10 · BOOTSTRAP
+// 10 · BOOTSTRAP
 //-------------------------------------------------------------------
 (async () => {
   try {
+    // 1) Backend wählen und initialisieren
     linkStore = await selectBackend();
+
+    // 2) Commands von der Disk laden
     const cmdList = loadCommands();
 
+    // 3) Discord-Client fertig → Slash-Commands registrieren
     client.once('ready', async () => {
       console.log(`🤖 Logged in as ${client.user.tag}`);
-      registerCommands(cmdList).catch(console.error);
+      try {
+        await registerCommands(cmdList);
+      } catch (e) {
+        console.error('🔴 Failed to register commands', e);
+      }
     });
 
-    await client.login(DISCORD);
-  } catch (e) {
-    console.error('Fatal startup error', e);
+    // 4) Login bei Discord
+    await client.login(DISCORD_TOKEN);
+  } catch (fatal) {
+    console.error('💀 Fatal startup error – shutting down', fatal);
     process.exit(1);
   }
 })();
-                       
