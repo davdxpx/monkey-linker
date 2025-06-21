@@ -1,6 +1,5 @@
-// commands/unlink.js – Unlink your Roblox account (final)
-// 🐒 Removes database entry, role, and sends confirmation embed
-// © StillBrokeStudios 2025 · @davdxpx
+// commands/unlink.js – Unlink your Roblox account (v2)
+// 🐒 2025 © StillBrokeStudios · @davdxpx
 
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 
@@ -9,45 +8,52 @@ module.exports = {
     .setName('unlink')
     .setDescription('Completely remove your linked Roblox account'),
 
-  async execute(interaction, db, cfg) {
+  /** @param {import('discord.js').ChatInputCommandInteraction} interaction
+   *  @param {Object} linkStore – unified DB API (get, upsert, verify, …)
+   *  @param {Object} cfg        – env constants (VERIFIED_ROLE_ID, GUILD_ID, …)
+   */
+  async execute(interaction, linkStore, cfg) {
     await interaction.deferReply({ ephemeral: true });
 
-    db.get('SELECT * FROM links WHERE discord = ? AND verified = 1', [interaction.user.id], (err, row) => {
-      if (err) {
-        console.error(err);
-        return interaction.editReply('❌ Database error. Try again later.');
+    try {
+      // 1️⃣ Datensatz holen
+      const row = await linkStore.get(interaction.user.id);
+
+      if (!row || !row.verified) {
+        return interaction.editReply('🚫 No verified Roblox link found for your account.');
       }
 
-      if (!row) {
-        return interaction.editReply('🚫 No verified link found for your account.');
+      // 2️⃣ DB‐Eintrag löschen
+      await linkStore.cleanupExpired(0);                // safety: clean unverified first
+      await linkStore.upsert({ ...row, verified: 0 });  // mark unverified
+      await linkStore.verify(interaction.user.id);      // or remove entry if you prefer
+      await linkStore.setAttempts(interaction.user.id, 0);
+
+      // ⚠️  Alternativ komplett entfernen:
+      // await linkStore.remove(interaction.user.id);   // ← implement in both back-ends if desired
+
+      // 3️⃣ Role entfernen (optional)
+      if (cfg.VERIFIED_ROLE_ID && cfg.GUILD_ID) {
+        try {
+          const guild  = await interaction.client.guilds.fetch(cfg.GUILD_ID);
+          const member = await guild.members.fetch(interaction.user.id);
+          await member.roles.remove(cfg.VERIFIED_ROLE_ID);
+        } catch (err) {
+          console.warn('Role removal failed:', err);
+        }
       }
 
-      // Delete the DB row
-      db.run('DELETE FROM links WHERE discord = ?', [interaction.user.id], async err => {
-        if (err) {
-          console.error(err);
-          return interaction.editReply('❌ Could not unlink due to an internal error.');
-        }
+      // 4️⃣ Bestätigungs-Embed schicken
+      const embed = new EmbedBuilder()
+        .setColor(0xe53935)
+        .setTitle('🔗 Link removed')
+        .setDescription('Your Discord account is no longer connected to Roblox.')
+        .setFooter({ text: 'You can /connect again any time.' });
 
-        // Remove Verified role if set
-        if (cfg.VERIFIED_ROLE_ID) {
-          try {
-            const guild = await interaction.client.guilds.fetch(cfg.GUILD_ID);
-            const member = await guild.members.fetch(interaction.user.id);
-            await member.roles.remove(cfg.VERIFIED_ROLE_ID);
-          } catch (e) {
-            console.error('Role removal failed:', e);
-          }
-        }
-
-        const embed = new EmbedBuilder()
-          .setColor(0xe53935)
-          .setTitle('🔗 Link removed')
-          .setDescription('Your Discord account is no longer connected to Roblox.')
-          .setFooter({ text: 'You can /connect again any time.' });
-
-        interaction.editReply({ embeds: [embed] });
-      });
-    });
+      await interaction.editReply({ embeds: [embed] });
+    } catch (err) {
+      console.error('unlink.js error:', err);
+      await interaction.editReply('❌ Internal error, please try again later.');
+    }
   }
 };
