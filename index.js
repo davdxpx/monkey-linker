@@ -174,20 +174,30 @@ async function registerCommands(list) {
 // 6 · INTERACTION HANDLER
 //-------------------------------------------------------------------
 client.on('interactionCreate', async interaction => {
+  // nur Chat-Slash-Commands
   if (!interaction.isChatInputCommand()) return;
+
+  /* ─── Backend bereit? ─────────────────────────────── */
+  if (!linkStore) {
+    // 3-Sek-Timeout umgehen → direkt antworten
+    return interaction.reply({
+      content: '⏳ Bot initialisiert noch … bitte gleich noch einmal `/connect` ausführen.',
+      ephemeral: true
+    }).catch(() => {});
+  }
+
   const cmd = client.commands.get(interaction.commandName);
   if (!cmd) return;
 
-  // simple per‑command cooldown (3 s default)
+  /* ─── simple 3-Sek-Cooldown pro User+Command ───────── */
   const key = `${interaction.user.id}:${cmd.data.name}`;
-  if (client.cooldowns.has(key)) {
-    const diff = Date.now() - client.cooldowns.get(key);
-    if (diff < (cmd.cooldown || 3000)) {
-      return interaction.reply({ content: '⏳ Cool‑down … try again shortly.', ephemeral: true });
-    }
+  if (client.cooldowns.has(key) &&
+      Date.now() - client.cooldowns.get(key) < (cmd.cooldown || 3000)) {
+    return interaction.reply({ content: '⏳ Cool-down … try again shortly.', ephemeral: true });
   }
   client.cooldowns.set(key, Date.now());
 
+  /* ─── eigentliche Command-Ausführung ──────────────── */
   try {
     await cmd.execute(interaction, linkStore, {
       VERIFIED_ROLE_ID,
@@ -201,7 +211,7 @@ client.on('interactionCreate', async interaction => {
     const respond = interaction.replied || interaction.deferred
       ? interaction.followUp.bind(interaction)
       : interaction.reply.bind(interaction);
-    respond({ content: '⚠️ Internal error', ephemeral: true }).catch(()=>{});
+    respond({ content: '⚠️ Internal error', ephemeral: true }).catch(() => {});
   }
 });
 
