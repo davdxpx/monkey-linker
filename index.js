@@ -82,18 +82,10 @@ client.commands  = new Collection();
 client.cooldowns = new Collection();
 // ─── globale Variable ───────────────────────
 let linkStore;
-// ─── Main-Bootstrap ─────────────────────────────────────
-(async () => {
-  linkStore = await selectBackend();   // Backend wählen & verbinden
-  await loadCommands(client);          // Slash-Commands laden
-  await client.login(process.env.BOT_TOKEN);
-})().catch(console.error);
-
 
 //-------------------------------------------------------------------
 // 4 · BACKEND IMPLEMENTATIONS
 //-------------------------------------------------------------------
-const sqlite3 = require('sqlite3').verbose();
 const DBSYNC_INT_SEC = 5 * 60;            // ⏰ SQLite-Cleanup alle 5 Minuten
 const MONGO_TIMEOUT  = 8_000;             // ⏰ 8 s – danach Fallback auf SQLite
 
@@ -340,12 +332,12 @@ process.on('uncaughtException' , e => console.error('UncaughtException', e));
 (async () => {
   try {
     // 1) Backend wählen und initialisieren
-    linkStore = await selectBackend();
+    linkStore = await selectBackend();      // globale Referenz füllen
 
-    // 2) Commands von der Disk laden
+    // 2) Commands von der Disk laden → client.commands wird befüllt
     const cmdList = loadCommands();
 
-    // 3) Discord-Client fertig → Slash-Commands registrieren
+    // 3) Nach Discord-Login: Slash-Commands registrieren
     client.once('ready', async () => {
       console.log(`🤖 Logged in as ${client.user.tag}`);
       try {
@@ -355,7 +347,7 @@ process.on('uncaughtException' , e => console.error('UncaughtException', e));
       }
     });
 
-    // 4) Login bei Discord
+    // 4) Discord-Login
     await client.login(DISCORD_TOKEN);
   } catch (fatal) {
     console.error('💀 Fatal startup error – shutting down', fatal);
