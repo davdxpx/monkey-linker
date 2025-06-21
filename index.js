@@ -81,7 +81,6 @@ const client = new Client({
 client.commands  = new Collection();
 client.cooldowns = new Collection();
 let linkStore;
-let linkStore;                                // global Ref
 (async () => {
 linkStore = await selectBackend();          // ← holt API-Objekt
 await loadCommands(client);                 // dein Loader
