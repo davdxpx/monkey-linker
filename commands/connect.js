@@ -1,125 +1,155 @@
 // commands/connect.js – /connect <RobloxUser>
-// ------------------------------------------------
-// Creates or updates a pending link between the invoking Discord user and a
-// Roblox account.
+// -----------------------------------------------------------------------------
+//  Creates or updates a *pending* link between the invoking Discord user and a
+//  Roblox account. The user must paste a 6‑character code into their Roblox
+//  profile "About" section and then react with ✅ (handled globally).
 //
-// • Max ATTEMPTS (default 3) before temporary block (15 min)
-// • Generates 6‑char HEX code → user pastes into Roblox profile About section
-// • Sends DM with instructions + ✅ reaction trigger handled globally
-// • Works with pluggable linkStore (Mongo or SQLite) – expects the same API
-//   that index.js passes to every command:
-//       execute(interaction, linkStore, env)
+//  ▸ Limits the number of attempts (default 3) – afterwards a 15‑minute cooldown
+//  ▸ Works with every backend that exposes a `linkStore` interface (get, upsert)
+//  ▸ Sends a DM with clear instructions + fallback message if DMs are closed
+//  ▸ Immediate `deferReply()` to avoid "Unknown interaction" (code 10062)
+//  ▸ Always edits the original reply – never double‑replies (prevents 40060)
 //
-// © StillBrokeStudios 2025 · @davdxpx
+//  © StillBrokeStudios 2025 · @davdxpx
+// -----------------------------------------------------------------------------
 
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const axios = require('axios');
-const crypto = require('node:crypto');
 
-// ENV overrides
-const ATTEMPT_LIMIT = parseInt(process.env.LINK_ATTEMPT_LIMIT ?? '3', 10);
-const PENDING_TIMEOUT = parseInt(process.env.LINK_PENDING_TIMEOUT ?? `${15 * 60}`, 10); // sec
-const DEBUG = process.env.DEBUG_CONNECT === '1';
+// ENV constants (pulled once)
+const ATTEMPT_LIMIT   = Number(process.env.LINK_ATTEMPT_LIMIT) || 3;
+const COOLDOWN_SEC    = Number(process.env.LINK_COOLDOWN_SEC)  || 900;   // 15 min
+const DEBUG           = process.env.DEBUG_CONNECT === '1';
 
+function log(...args) { if (DEBUG) console.log('🟡 [connect]', ...args); }
+
+// ───────────────────────────────────────────────────────────────────────────────
 module.exports = {
   data: new SlashCommandBuilder()
     .setName('connect')
-    .setDescription('Link your Roblox account to Monkey Simulator')
-    .addStringOption(opt =>
-      opt.setName('robloxuser')
-        .setDescription('Exact Roblox username (case‑sensitive)')
-        .setRequired(true)
-    ),
+    .setDescription('Link your Discord account with a Roblox profile')
+    .addStringOption(o =>
+      o.setName('robloxuser')
+       .setDescription('Roblox username or ID you want to link')
+       .setRequired(true)),
 
   /**
-   * @param {import('discord.js').ChatInputCommandInteraction} i
-   * @param {import('../db/types').LinkStore} linkStore – injected by index.js
-   * @param {object} env – env vars forwarded by index.js (not used here)
+   * @param {import('discord.js').ChatInputCommandInteraction} interaction
+   * @param {Object} linkStore        Store injected by index.js (Mongo / SQLite)
    */
-  async execute(i, linkStore) {
-    const robloxUser = i.options.getString('robloxuser', true).trim();
-    await i.deferReply({ ephemeral: true });
+  async execute(interaction, linkStore) {
+    // 1️⃣ – ACKNOWLEDGE _IMMEDIATELY_ (ephemeral)
+    await interaction.deferReply({ ephemeral: true });
 
-    // 1️⃣ Roblox Username → userId lookup ---------------------------------------------------
-    let userId;
+    const discordId = interaction.user.id;
+    const robloxArg = interaction.options.getString('robloxuser').trim();
+
     try {
-      const { data } = await axios.post(
-        'https://users.roblox.com/v1/usernames/users',
-        { usernames: [robloxUser], excludeBannedUsers: true },
-        { timeout: 6_000 }
-      );
-      userId = data?.data?.[0]?.id;
-    } catch (err) {
-      console.error('[connect] Roblox API error', err);
-      return i.editReply('⚠️ Roblox API error – please try again later.');
-    }
+      // 2️⃣ – Resolve Roblox ID & DisplayName via Roblox API
+      const robloxId = await resolveRobloxId(robloxArg);
+      const profile  = await fetchRobloxProfile(robloxId);
+      log('Resolved', robloxArg, '→', robloxId, profile.displayName);
 
-    if (!userId) {
-      return i.editReply('🚫 **Roblox user not found** – check spelling and try again.');
-    }
+      // 3️⃣ – Fetch/Analyse link row
+      let row = await linkStore.get(discordId);
 
-    // 2️⃣ Check existing link or pending request -------------------------------------------
-    const existing = await linkStore.get(i.user.id);
-
-    if (existing?.verified) {
-      return i.editReply(`✅ **Already linked** to Roblox ID \`${existing.roblox}\``);
-    }
-
-    // Attempt limitation logic -------------------------------------------------------------
-    const nowSec = Math.floor(Date.now() / 1000);
-    let attempts = existing?.attempts ?? 0;
-
-    if (existing && !existing.verified) {
-      // pending link exists – check time window & attempts
-      const age = nowSec - (existing.created ?? nowSec);
-      if (attempts >= ATTEMPT_LIMIT && age < PENDING_TIMEOUT) {
-        const waitMin = Math.ceil((PENDING_TIMEOUT - age) / 60);
-        return i.editReply(`⏳ You reached the maximum of **${ATTEMPT_LIMIT}** attempts. ` +
-          `Please wait **${waitMin} min** before trying again.`);
+      // Create skeleton row if none exists
+      if (!row) {
+        row = {
+          discord: discordId,
+          roblox:  robloxId,
+          code:    null,
+          verified:false,
+          attempts:0,
+          lastAttempt:0,
+          created: Math.floor(Date.now() / 1000)
+        };
       }
-      // Otherwise: we allow another attempt (regenerate code)
-    }
 
-    attempts += 1;
+      // If already verified
+      if (row.verified) {
+        return interaction.editReply({ content: '✅ Your account is already linked.' });
+      }
 
-    // 3️⃣ Generate fresh verification code --------------------------------------------------
-    const code = crypto.randomBytes(3).toString('hex').toUpperCase(); // 6‑char HEX eg E4A1B9
+      // Cool‑down check
+      const now = Math.floor(Date.now() / 1000);
+      if (row.attempts >= ATTEMPT_LIMIT && (now - row.lastAttempt) < COOLDOWN_SEC) {
+        const waitMin = Math.ceil((COOLDOWN_SEC - (now - row.lastAttempt)) / 60);
+        return interaction.editReply({ content: `⏳ Too many attempts. Please wait **${waitMin} min** and try again.` });
+      }
 
-    // 4️⃣ Upsert pending link in DB ---------------------------------------------------------
-    await linkStore.upsert({
-      discord: i.user.id,
-      roblox: userId,
-      code,
-      verified: 0,
-      created: nowSec,
-      attempts
-    });
+      // 4️⃣ – Generate new verification code
+      const code = generateCode();
+      row.code         = code;
+      row.roblox       = robloxId;          // allow updating target account
+      row.attempts     = row.attempts + 1;
+      row.lastAttempt  = now;
+      row.verified     = false;
 
-    if (DEBUG) console.log(`[connect] Upsert link row →`, i.user.id, userId, code, attempts);
+      await linkStore.upsert(row);
+      log('Saved row', row);
 
-    // 5️⃣ DM instructions ------------------------------------------------------------------
-    const embed = new EmbedBuilder()
-      .setColor(0xffc107)
-      .setTitle('🔗 Final Step – Verify your account')
-      .setDescription(
-        `1. **Copy** the code below and paste it into your Roblox profile _About_ section.
-` +
-        `2. **React** with ✅ to this DM within **${PENDING_TIMEOUT / 60} minutes**.
-` +
-        `3. You can **remove** the code after verification.
+      // 5️⃣ – Send DM instructions
+      const dmEmbed = new EmbedBuilder()
+        .setColor(0x00bcd4)
+        .setTitle('🔗 Link your Roblox account')
+        .setDescription(
+          `1. Copy the code below \➡️ paste it into **your Roblox profile About section**\.
+           2. Come back and react with ✅ under the last bot message\.
+           3. Bot verifies & gives you <@&${process.env.VERIFIED_ROLE_ID || 'role'}> role\.
+           \u200b`)
+        .addFields(
+          { name: 'Roblox User', value: `[${profile.displayName}](https://www.roblox.com/users/${robloxId}/profile)`, inline: true },
+          { name: 'Code', value: `\`${code}\``, inline: true },
+          { name: '\u200b', value: '\u200b' })
+        .setThumbnail(`https://thumbnails.roblox.com/v1/users/avatar?userIds=${robloxId}&size=150x150&format=Png&isCircular=true`)
+        .setFooter({ text: `Attempt ${row.attempts}/${ATTEMPT_LIMIT}` });
 
-` +
-        `​`
-      )
-      .addFields({ name: 'Code', value: `\`${code}\`` })
-      .setFooter({ text: `Attempt ${attempts}/${ATTEMPT_LIMIT}` });
+      let dmSuccess = true;
+      try {
+        await interaction.user.send({ embeds: [dmEmbed] });
+      } catch (e) {
+        dmSuccess = false;
+        log('DM failed – user has DMs closed');
+      }
 
-    try {
-      const dm = await i.user.send({ embeds: [embed] });
-      await dm.react('✅');
-      await i.editReply('📩 Check your DMs – follow the instructions to finish linking!');
-    } catch {
-      return i.editReply('❌ Could not send you a DM. Please enable private messages and try again.');
+      const publicMsg = dmSuccess
+        ? '📨 Check your DMs – follow the instructions to complete verification!'
+        : '⚠️ I could not DM you. Please enable DMs and try again.';
+
+      return interaction.editReply({ content: publicMsg });
+
+    } catch (err) {
+      console.error('💥 /connect error:', err);
+      const msg = typeof err === 'string' ? err : '❌ Failed to create link. Please try again later.';
+      return interaction.editReply({ content: msg });
     }
   }
 };
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ───────────────────────────────────────────────────────────────────────────────
+
+function generateCode() {
+  return Math.random().toString(16).slice(2, 8).toUpperCase(); // 6‑hex chars
+}
+
+async function resolveRobloxId(input) {
+  // If purely digits treat as ID
+  if (/^\d+$/.test(input)) return Number(input);
+
+  // Username lookup → ID
+  const { data } = await axios.post('https://users.roblox.com/v1/usernames/users', {
+    usernames: [input],
+    excludeBannedUsers: true
+  }, { timeout: 5000 });
+
+  if (!data?.data?.length) throw '❌ Roblox user not found.';
+  return data.data[0].id;
+}
+
+async function fetchRobloxProfile(userId) {
+  const { data } = await axios.get(`https://users.roblox.com/v1/users/${userId}`, { timeout: 5000 });
+  return data;
+}
