@@ -80,6 +80,7 @@ const client = new Client({
 });
 client.commands  = new Collection();
 client.cooldowns = new Collection();
+let linkStore;
 
 //-------------------------------------------------------------------
 // 4 · BACKEND IMPLEMENTATIONS
@@ -107,7 +108,7 @@ async function initSqlite() {
     const api = {
       get:        d => sql.get('SELECT * FROM links WHERE discord=?', [d]),
       getByRb:    r => sql.get('SELECT * FROM links WHERE roblox=?',  [r]),
-      upsertLink: ({ discord, roblox, code, attempts=0 }) => sql.run(
+      upsert: ({ discord, roblox, code, attempts=0 }) => sql.run(
         'INSERT OR REPLACE INTO links (discord, roblox, code, attempts, verified, created) VALUES (?,?,?,?,0,strftime("%s","now"))',
         [discord, roblox, code, attempts],
       ),
