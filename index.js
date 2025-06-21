@@ -80,12 +80,15 @@ const client = new Client({
 });
 client.commands  = new Collection();
 client.cooldowns = new Collection();
+// ─── globale Variable ───────────────────────
 let linkStore;
+// ─── Main-Bootstrap ─────────────────────────────────────
 (async () => {
-linkStore = await selectBackend();          // ← holt API-Objekt
-await loadCommands(client);                 // dein Loader
-await client.login(process.env.BOT_TOKEN);
+  linkStore = await selectBackend();   // Backend wählen & verbinden
+  await loadCommands(client);          // Slash-Commands laden
+  await client.login(process.env.BOT_TOKEN);
 })().catch(console.error);
+
 
 //-------------------------------------------------------------------
 // 4 · BACKEND IMPLEMENTATIONS
