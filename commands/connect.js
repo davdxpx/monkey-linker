@@ -107,6 +107,7 @@ module.exports = {
       let dmSuccess = true;
       try {
         await interaction.user.send({ embeds: [dmEmbed] });
+        await dmMessage.react('✅').catch(() => {});
       } catch (e) {
         dmSuccess = false;
         log('DM failed – user likely has DMs disabled');
