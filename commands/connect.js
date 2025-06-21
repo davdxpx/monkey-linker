@@ -10,16 +10,16 @@
 //  ▸ Immediate `deferReply()` to avoid "Unknown interaction" (code 10062)
 //  ▸ Always edits the original reply – never double‑replies (prevents 40060)
 //
-//  © StillBrokeStudios 2025 · @davdxpx
+//  © StillBrokeStudios 2025 · @davdxpx
 // -----------------------------------------------------------------------------
 
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
-const axios = require('axios');
+const axios   = require('axios');
 
 // ENV constants (pulled once)
-const ATTEMPT_LIMIT   = Number(process.env.LINK_ATTEMPT_LIMIT) || 3;
-const COOLDOWN_SEC    = Number(process.env.LINK_COOLDOWN_SEC)  || 900;   // 15 min
-const DEBUG           = process.env.DEBUG_CONNECT === '1';
+const ATTEMPT_LIMIT = Number(process.env.LINK_ATTEMPT_LIMIT) || 3;
+const COOLDOWN_SEC  = Number(process.env.LINK_COOLDOWN_SEC)  || 900; // 15 min
+const DEBUG         = process.env.DEBUG_CONNECT === '1';
 
 function log(...args) { if (DEBUG) console.log('🟡 [connect]', ...args); }
 
@@ -38,19 +38,19 @@ module.exports = {
    * @param {Object} linkStore        Store injected by index.js (Mongo / SQLite)
    */
   async execute(interaction, linkStore) {
-    // 1️⃣ – ACKNOWLEDGE _IMMEDIATELY_ (ephemeral)
-    await interaction.deferReply({ ephemeral: true });
+    // 1️⃣ ACKNOWLEDGE _IMMEDIATELY_ (ephemeral)
+    await interaction.deferReply({ flags: 1 << 6 }); // 64 = EPHEMERAL
 
     const discordId = interaction.user.id;
     const robloxArg = interaction.options.getString('robloxuser').trim();
 
     try {
-      // 2️⃣ – Resolve Roblox ID & DisplayName via Roblox API
+      // 2️⃣ Resolve Roblox ID & DisplayName via Roblox API
       const robloxId = await resolveRobloxId(robloxArg);
       const profile  = await fetchRobloxProfile(robloxId);
       log('Resolved', robloxArg, '→', robloxId, profile.displayName);
 
-      // 3️⃣ – Fetch/Analyse link row
+      // 3️⃣ Fetch/Analyse link row
       let row = await linkStore.get(discordId);
 
       // Create skeleton row if none exists
@@ -66,38 +66,37 @@ module.exports = {
         };
       }
 
-      // If already verified
+      // Already verified?
       if (row.verified) {
-        return interaction.editReply({ content: '✅ Your account is already linked.' });
+        return interaction.editReply({ content: '✅ Your Discord account is already linked to this Roblox user.' });
       }
 
       // Cool‑down check
       const now = Math.floor(Date.now() / 1000);
       if (row.attempts >= ATTEMPT_LIMIT && (now - row.lastAttempt) < COOLDOWN_SEC) {
         const waitMin = Math.ceil((COOLDOWN_SEC - (now - row.lastAttempt)) / 60);
-        return interaction.editReply({ content: `⏳ Too many attempts. Please wait **${waitMin} min** and try again.` });
+        return interaction.editReply({ content: `⏳ Too many attempts. Please wait **${waitMin} min** and try again.` });
       }
 
-      // 4️⃣ – Generate new verification code
+      // 4️⃣ Generate new verification code
       const code = generateCode();
-      row.code         = code;
-      row.roblox       = robloxId;          // allow updating target account
-      row.attempts     = row.attempts + 1;
-      row.lastAttempt  = now;
-      row.verified     = false;
+      row.code        = code;
+      row.roblox      = robloxId;            // allow updating target account
+      row.attempts    = row.attempts + 1;
+      row.lastAttempt = now;
+      row.verified    = false;
 
       await linkStore.upsert(row);
       log('Saved row', row);
 
-      // 5️⃣ – Send DM instructions
+      // 5️⃣ Send DM instructions
       const dmEmbed = new EmbedBuilder()
         .setColor(0x00bcd4)
         .setTitle('🔗 Link your Roblox account')
         .setDescription(
-          `1. Copy the code below \➡️ paste it into **your Roblox profile About section**\.
-           2. Come back and react with ✅ under the last bot message\.
-           3. Bot verifies & gives you <@&${process.env.VERIFIED_ROLE_ID || 'role'}> role\.
-           \u200b`)
+          `1\. Copy the code below → paste it into **your Roblox profile About section**\.
+           2\. Come back and react with ✅ under the last bot message\.
+           3\. Bot verifies & assigns you the <@&${process.env.VERIFIED_ROLE_ID || 'VerifiedRole'}> role\.`)
         .addFields(
           { name: 'Roblox User', value: `[${profile.displayName}](https://www.roblox.com/users/${robloxId}/profile)`, inline: true },
           { name: 'Code', value: `\`${code}\``, inline: true },
@@ -110,12 +109,12 @@ module.exports = {
         await interaction.user.send({ embeds: [dmEmbed] });
       } catch (e) {
         dmSuccess = false;
-        log('DM failed – user has DMs closed');
+        log('DM failed – user likely has DMs disabled');
       }
 
       const publicMsg = dmSuccess
         ? '📨 Check your DMs – follow the instructions to complete verification!'
-        : '⚠️ I could not DM you. Please enable DMs and try again.';
+        : '⚠️ I could not DM you. Please enable DMs and use /connect again.';
 
       return interaction.editReply({ content: publicMsg });
 
@@ -128,7 +127,7 @@ module.exports = {
 };
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Helpers
+// Helper functions
 // ───────────────────────────────────────────────────────────────────────────────
 
 function generateCode() {
@@ -139,7 +138,7 @@ async function resolveRobloxId(input) {
   // If purely digits treat as ID
   if (/^\d+$/.test(input)) return Number(input);
 
-  // Username lookup → ID
+  // Username lookup → userId
   const { data } = await axios.post('https://users.roblox.com/v1/usernames/users', {
     usernames: [input],
     excludeBannedUsers: true
