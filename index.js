@@ -164,6 +164,7 @@ async function initMongoBackend(cfg) {
     get:       d => col.findOne({ discord: d }),
     getByRb:   r => col.findOne({ roblox: r }),
     upsert:    row => col.updateOne({ discord: row.discord }, { $set: row }, { upsert: true }),
+    remove:    d => col.deleteOne({ discord: d }),
     setAttempts:(d, a) => col.updateOne({ discord: d }, { $set: { attempts: a } }),
     verify:    d => col.updateOne({ discord: d }, { $set: { verified: 1 } }),
     cleanupExpired: s =>
