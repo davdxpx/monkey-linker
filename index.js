@@ -127,6 +127,7 @@ async function initSqlite(DB_PATH = './links.db') {
            VALUES (?,?,?,?,?,?,strftime('%s','now'))`,
           [discord, roblox, code, attempts, lastAttempt, verified]
         ),
+      remove:    d => sql.run('DELETE FROM links WHERE discord=?', [d]),
       setAttempts:   (d, a) => sql.run('UPDATE links SET attempts=? WHERE discord=?', [a, d]),
       verify:        d      => sql.run('UPDATE links SET verified=1 WHERE discord=?', [d]),
       cleanupExpired:s      => sql.run(
