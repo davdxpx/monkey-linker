@@ -82,6 +82,7 @@ client.commands  = new Collection();
 client.cooldowns = new Collection();
 // ─── globale Variable ───────────────────────
 let linkStore;
+const reactionCache = new Map();
 
 //-------------------------------------------------------------------
 // 4 · BACKEND IMPLEMENTATIONS
@@ -128,7 +129,9 @@ async function initSqlite(DB_PATH = './links.db') {
           [discord, roblox, code, attempts, lastAttempt, verified]
         ),
       remove:    d => sql.run('DELETE FROM links WHERE discord=?', [d]),
-      setAttempts:   (d, a) => sql.run('UPDATE links SET attempts=? WHERE discord=?', [a, d]),
+      setAttempts:   (d, a, ts) => ts
+        ? sql.run('UPDATE links SET attempts=?, lastAttempt=? WHERE discord=?', [a, ts, d])
+        : sql.run('UPDATE links SET attempts=? WHERE discord=?', [a, d]),
       verify:        d      => sql.run('UPDATE links SET verified=1 WHERE discord=?', [d]),
       cleanupExpired:s      => sql.run(
         'DELETE FROM links WHERE verified=0 AND (strftime("%s","now")-created) > ?',
@@ -165,7 +168,11 @@ async function initMongoBackend(cfg) {
     getByRb:   r => col.findOne({ roblox: r }),
     upsert:    row => col.updateOne({ discord: row.discord }, { $set: row }, { upsert: true }),
     remove:    d => col.deleteOne({ discord: d }),
-    setAttempts:(d, a) => col.updateOne({ discord: d }, { $set: { attempts: a } }),
+    setAttempts:(d, a, ts) => {
+      const upd = { attempts: a };
+      if (ts) upd.lastAttempt = ts;
+      return col.updateOne({ discord: d }, { $set: upd });
+    },
     verify:    d => col.updateOne({ discord: d }, { $set: { verified: 1 } }),
     cleanupExpired: s =>
       col.deleteMany({ verified: 0, created: { $lt: Math.floor(Date.now() / 1000) - s } }),
@@ -273,9 +280,17 @@ client.on('interactionCreate', async interaction => {
 client.on('messageReactionAdd', async (reaction, user) => {
   if (user.bot || reaction.emoji.name !== '✅') return;
   if (reaction.partial) await reaction.fetch();
+  if (reaction.message.author?.id !== client.user.id) return;
+  const last = reactionCache.get(user.id) || 0;
+  if (Date.now() - last < 1000) return;
+  reactionCache.set(user.id, Date.now());
   try {
     const row = await linkStore.get(user.id);
     if (!row || row.verified) return;
+
+    const attempts = (row.attempts || 0) + 1;
+    const ts = Math.floor(Date.now() / 1000);
+    await linkStore.setAttempts?.(user.id, attempts, ts).catch(()=>{});
 
     const { data: profile } = await axios.get(`https://users.roblox.com/v1/users/${row.roblox}`);
     if (!profile?.description?.includes(row.code))

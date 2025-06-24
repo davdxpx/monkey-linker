@@ -17,9 +17,14 @@ const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const axios   = require('axios');
 
 // ENV constants (pulled once)
-const ATTEMPT_LIMIT = Number(process.env.LINK_ATTEMPT_LIMIT) || 3;
+const ATTEMPT_LIMIT = Number(process.env.LINK_ATTEMPT_LIMIT) || 2;
 const COOLDOWN_SEC  = Number(process.env.LINK_COOLDOWN_SEC)  || 900; // 15 min
 const DEBUG         = process.env.DEBUG_CONNECT === '1';
+
+// In-memory rate limit for the /connect command
+const CMD_LIMIT = 2;
+const CMD_WINDOW = COOLDOWN_SEC * 1000; // 15 min by default
+const cmdUsage = new Map(); // userId -> { count, ts }
 
 function log(...args) { if (DEBUG) console.log('🟡 [connect]', ...args); }
 
@@ -71,22 +76,31 @@ module.exports = {
         return interaction.editReply({ content: '✅ Your Discord account is already linked to this Roblox user.' });
       }
 
-      // Cool‑down check
-      const now = Math.floor(Date.now() / 1000);
-      if (row.attempts >= ATTEMPT_LIMIT && (now - row.lastAttempt) < COOLDOWN_SEC) {
-        const waitMin = Math.ceil((COOLDOWN_SEC - (now - row.lastAttempt)) / 60);
+      // Cool‑down check for the /connect command (max 2 per 15 min)
+      const now = Date.now();
+      const usage = cmdUsage.get(discordId) || { count: 0, ts: now };
+      if (now - usage.ts > CMD_WINDOW) {
+        usage.count = 0;
+        usage.ts = now;
+      }
+      if (usage.count >= CMD_LIMIT) {
+        const waitMin = Math.ceil((CMD_WINDOW - (now - usage.ts)) / 60000);
         return interaction.editReply({ content: `⏳ Too many attempts. Please wait **${waitMin} min** and try again.` });
       }
+      usage.count++;
+      cmdUsage.set(discordId, usage);
 
       // 4️⃣ Generate new verification code
       const code = generateCode();
-      row.code        = code;
-      row.roblox      = robloxId;            // allow updating target account
-      row.attempts    = row.attempts + 1;
-      row.lastAttempt = now;
-      row.verified    = false;
+      row.code     = code;
+      row.roblox   = robloxId;               // allow updating target account
+      row.verified = false;
 
-      await linkStore.upsert(row);
+      await linkStore.upsert({
+        ...row,
+        attempts: row.attempts,
+        lastAttempt: row.lastAttempt
+      });
       log('Saved row', row);
 
       // 5️⃣ Send DM instructions
@@ -102,11 +116,11 @@ module.exports = {
           { name: 'Code', value: `\`${code}\``, inline: true },
           { name: '\u200b', value: '\u200b' })
         .setThumbnail(`https://thumbnails.roblox.com/v1/users/avatar?userIds=${robloxId}&size=150x150&format=Png&isCircular=true`)
-        .setFooter({ text: `Attempt ${row.attempts}/${ATTEMPT_LIMIT}` });
+        .setFooter({ text: `Attempt ${row.attempts + 1}/${ATTEMPT_LIMIT}` });
 
       let dmSuccess = true;
       try {
-        await interaction.user.send({ embeds: [dmEmbed] });
+        const dmMessage = await interaction.user.send({ embeds: [dmEmbed] });
         await dmMessage.react('✅').catch(() => {});
       } catch (e) {
         dmSuccess = false;
