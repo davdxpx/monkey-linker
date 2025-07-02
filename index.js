@@ -82,6 +82,7 @@ const client = new Client({
 });
 client.commands  = new Collection();
 client.cooldowns = new Collection();
+client.pendingEventCreations = new Map(); // Map to temporarily store data between command and modal
 // ─── globale Variable ───────────────────────
 let linkStore;
 const reactionCache = new Map();
@@ -226,8 +227,64 @@ async function initSqlite(DB_PATH = './links.db') {
         return sql.run(`UPDATE events SET ${setClause}, updated_at = ? WHERE event_id = ?`, values);
       },
       // Placeholder for RSVP methods - to be implemented in Phase 2
-      addRsvp: (eventId, userId, rsvpStatus) => { /* ... */ },
-      getRsvpsForEvent: (eventId) => { /* ... */ },
+      // addRsvp: (eventId, userId, rsvpStatus) => { /* ... */ },
+      // getRsvpsForEvent: (eventId) => { /* ... */ },
+
+      // RSVP Management Methods (SQLite)
+      addRsvp: async (eventId, userId, rsvpStatus) => {
+        const now = Math.floor(Date.now() / 1000);
+        // Upsert logic: Insert or replace RSVP
+        await sql.run(
+          `INSERT INTO event_rsvps (event_id, user_discord_id, rsvp_status, rsvp_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT(event_id, user_discord_id) DO UPDATE SET rsvp_status = excluded.rsvp_status, rsvp_at = excluded.rsvp_at`,
+          [eventId, userId, rsvpStatus, now]
+        );
+        // Update counts on events table
+        const counts = await sql.get(
+          `SELECT
+             SUM(CASE WHEN rsvp_status = 'going' THEN 1 ELSE 0 END) as going,
+             SUM(CASE WHEN rsvp_status = 'interested' THEN 1 ELSE 0 END) as interested
+           FROM event_rsvps WHERE event_id = ?`,
+          [eventId]
+        );
+        await sql.run('UPDATE events SET rsvp_count_going = ?, rsvp_count_interested = ?, updated_at = ? WHERE event_id = ?',
+          [counts.going || 0, counts.interested || 0, now, eventId]);
+        return true;
+      },
+      getRsvp: (eventId, userId) => sql.get('SELECT * FROM event_rsvps WHERE event_id = ? AND user_discord_id = ?', [eventId, userId]),
+      getRsvpsForEvent: (eventId, status = null) => {
+        if (status) {
+          return sql.all('SELECT * FROM event_rsvps WHERE event_id = ? AND rsvp_status = ? ORDER BY rsvp_at ASC', [eventId, status]);
+        }
+        return sql.all('SELECT * FROM event_rsvps WHERE event_id = ? ORDER BY rsvp_at ASC', [eventId]);
+      },
+
+      // Custom Field Methods (SQLite)
+      addEventCustomField: (eventId, fieldName, fieldValue, displayOrder = 0) => { // Renamed for clarity
+        return sql.run(
+          `INSERT INTO event_custom_fields (event_id, field_name, field_value, display_order) VALUES (?, ?, ?, ?)`,
+          [eventId, fieldName, fieldValue, displayOrder]
+        ).then(function() { return this.lastID; });
+      },
+      getEventCustomFields: (eventId) => { // Renamed for clarity
+        return sql.all('SELECT * FROM event_custom_fields WHERE event_id = ? ORDER BY display_order ASC, custom_field_id ASC', [eventId]);
+      },
+      updateEventCustomField: (customFieldId, fieldName, fieldValue, displayOrder) => { // Renamed for clarity
+        const updates = [];
+        const values = [];
+        if (fieldName !== undefined) { updates.push('field_name = ?'); values.push(fieldName); }
+        if (fieldValue !== undefined) { updates.push('field_value = ?'); values.push(fieldValue); }
+        if (displayOrder !== undefined) { updates.push('display_order = ?'); values.push(displayOrder); }
+        if (updates.length === 0) return Promise.resolve();
+        values.push(customFieldId);
+        return sql.run(`UPDATE event_custom_fields SET ${updates.join(', ')} WHERE custom_field_id = ?`, values);
+      },
+      deleteEventCustomField: (customFieldId) => { // Renamed for clarity
+        return sql.run('DELETE FROM event_custom_fields WHERE custom_field_id = ?', [customFieldId]);
+      },
+      deleteEventCustomFieldsByEventId: (eventId) => { // Renamed for clarity
+        return sql.run('DELETE FROM event_custom_fields WHERE event_id = ?', [eventId]);
+      }
     };
 
     // ⏰ Periodische Bereinigung: nicht verifizierte Links nach 15 min löschen
@@ -303,8 +360,57 @@ async function initMongoBackend(cfg) {
         return eventsCol.updateOne({ _id: eventId }, { $set: updatePayload });
     },
     // Placeholder for RSVP methods
-    addRsvp: (eventId, userId, rsvpStatus) => { /* ... */ },
-    getRsvpsForEvent: (eventId) => { /* ... */ },
+    // addRsvp: (eventId, userId, rsvpStatus) => { /* ... */ },
+    // getRsvpsForEvent: (eventId) => { /* ... */ },
+
+    // RSVP Management Methods (MongoDB)
+    addRsvp: async (eventId, userId, rsvpStatus) => {
+        const now = Math.floor(Date.now() / 1000);
+        await eventRsvpsCol.updateOne(
+            { event_id: eventId, user_discord_id: userId },
+            { $set: { rsvp_status: rsvpStatus, rsvp_at: now } },
+            { upsert: true }
+        );
+        // Update counts on events table
+        const goingCount = await eventRsvpsCol.countDocuments({ event_id: eventId, rsvp_status: 'going' });
+        const interestedCount = await eventRsvpsCol.countDocuments({ event_id: eventId, rsvp_status: 'interested' });
+        await eventsCol.updateOne({ _id: eventId }, { $set: { rsvp_count_going: goingCount, rsvp_count_interested: interestedCount, updated_at: now } });
+        return true;
+    },
+    getRsvp: (eventId, userId) => eventRsvpsCol.findOne({ event_id: eventId, user_discord_id: userId }),
+    getRsvpsForEvent: (eventId, status = null) => {
+        const query = { event_id: eventId };
+        if (status) {
+            query.rsvp_status = status;
+        }
+        return eventRsvpsCol.find(query).sort({ rsvp_at: 1 }).toArray();
+    },
+
+    // Custom Field Methods (MongoDB)
+    addEventCustomField: async (eventId, fieldName, fieldValue, displayOrder = 0) => { // Renamed
+        const result = await eventCustomFieldsCol.insertOne({ event_id: eventId, field_name: fieldName, field_value: fieldValue, display_order: displayOrder });
+        return result.insertedId;
+    },
+    getEventCustomFields: (eventId) => { // Renamed
+        return eventCustomFieldsCol.find({ event_id: eventId }).sort({ display_order: 1, _id: 1 }).toArray();
+    },
+    updateEventCustomField: (customFieldId, fieldName, fieldValue, displayOrder) => { // Renamed
+        const updates = {};
+        if (fieldName !== undefined) updates.field_name = fieldName;
+        if (fieldValue !== undefined) updates.field_value = fieldValue;
+        if (displayOrder !== undefined) updates.display_order = displayOrder;
+        if (Object.keys(updates).length === 0) return Promise.resolve();
+        // Assuming customFieldId is ObjectId for Mongo
+        const { ObjectId } = require('mongodb'); // Ensure ObjectId is available
+        return eventCustomFieldsCol.updateOne({ _id: new ObjectId(customFieldId) }, { $set: updates });
+    },
+    deleteEventCustomField: (customFieldId) => { // Renamed
+        const { ObjectId } = require('mongodb');
+        return eventCustomFieldsCol.deleteOne({ _id: new ObjectId(customFieldId) });
+    },
+    deleteEventCustomFieldsByEventId: (eventId) => { // Renamed
+        return eventCustomFieldsCol.deleteMany({ event_id: eventId });
+    }
   };
   return { db, api: mongoApi, dbType: 'mongo' };
 }
@@ -363,17 +469,21 @@ async function registerCommands(list) {
 // 6 · INTERACTION HANDLER
 //-------------------------------------------------------------------
 client.on('interactionCreate', async interaction => {
-  // Handle Modal Submissions for Event Creation
-  if (interaction.isModalSubmit() && interaction.customId === 'eventCreateModal') {
-    try {
-      // Defer update as interaction was already deferred by the /events create command
-      // await interaction.deferUpdate(); // or deferReply({ephemeral: true}) if the initial defer was not done
-
+  // Handle Modal Submissions & Button Interactions
+  if (interaction.isModalSubmit()) {
+    if (interaction.customId === 'eventCreateModal') {
+      try {
       const title = interaction.fields.getTextInputValue('eventTitle');
       const description = interaction.fields.getTextInputValue('eventDescription');
       const dateStr = interaction.fields.getTextInputValue('eventDate');
       const timeStr = interaction.fields.getTextInputValue('eventTime');
-      const imageMainUrl = interaction.fields.getTextInputValue('eventImageMainUrl') || null;
+      let imageMainUrl = interaction.fields.getTextInputValue('eventImageMainUrl') || null; // From modal
+
+      // Check if there was a pre-uploaded image from the command
+      const pendingData = client.pendingEventCreations.get(interaction.user.id);
+      if (pendingData && pendingData.attachmentUrl) {
+        imageMainUrl = pendingData.attachmentUrl; // Prioritize uploaded image
+      }
 
       // TODO: Add island/area selection logic. For now, placeholders.
       // This would typically involve another interaction step (select menu) after modal,
@@ -408,23 +518,143 @@ client.on('interactionCreate', async interaction => {
         .setColor(0x4CAF50) // SUCCESS_COLOR
         .setTitle('🎉 Event Draft Created!')
         .setDescription(`Your event draft "**${title}**" has been created with ID #${eventId}.`)
-        .addFields({ name: 'Next Steps', value: `Use \`/events publish event_id:${eventId}\` to announce it.\nYou can also use \`/events edit event_id:${eventId}\` to further refine details or add location.` })
+        .addFields({ name: 'Next Steps', value: `Use \`/events publish event_id:${eventId}\` to announce it.\nYou can also use \`/events edit event_id:${eventId}\` to further refine details, add location, or manage custom fields.` })
         .setTimestamp();
-      // The initial reply from /events create was deferred. We need to edit that.
-      // The interaction object here is for the modal submit.
-      // We need to find the original interaction if we want to edit its reply.
-      // However, the /events create command itself deferred its reply.
-      // It's simpler to send a new ephemeral followup from the modal.
-      return interaction.reply({ embeds: [successEmbed], ephemeral: true });
+
+      const actionRow = new ActionRowBuilder()
+        .addComponents(
+            new ButtonBuilder()
+                .setCustomId(`manage-custom-fields-${eventId}`)
+                .setLabel('Manage Custom Fields')
+                .setStyle(2) // Secondary
+        );
+
+      await interaction.reply({ embeds: [successEmbed], components: [actionRow], ephemeral: true });
+
+      if (pendingData) {
+        client.pendingEventCreations.delete(interaction.user.id); // Clean up
+      }
 
     } catch (modalError) {
       console.error('Error processing eventCreateModal:', modalError);
-      return interaction.reply({ content: 'There was an error creating your event draft from the modal. Please try again.', ephemeral: true }).catch(()=>{});
+      // Ensure reply if not already done
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: 'There was an error creating your event draft. Please try again.', ephemeral: true }).catch(()=>{});
+      } else {
+        await interaction.followUp({ content: 'There was an error creating your event draft. Please try again.', ephemeral: true }).catch(()=>{});
+      }
     }
+   } else if (interaction.customId.startsWith('customFieldAddModal-')) {
+      try {
+        const eventId = parseInt(interaction.customId.split('-')[1], 10);
+        const fieldName = interaction.fields.getTextInputValue('customFieldName');
+        const fieldValue = interaction.fields.getTextInputValue('customFieldValue');
+        const displayOrderStr = interaction.fields.getTextInputValue('customFieldDisplayOrder');
+        const displayOrder = displayOrderStr ? parseInt(displayOrderStr, 10) : 0;
+
+        if (!fieldName || !fieldValue) {
+          return interaction.reply({ content: 'Field Name and Field Value are required.', ephemeral: true });
+        }
+
+        await linkStore.addEventCustomField(eventId, fieldName, fieldValue, displayOrder || 0);
+
+        const row = new ActionRowBuilder()
+          .addComponents(
+            new ButtonBuilder().setCustomId(`manage-custom-fields-${eventId}`).setLabel('Add Another Field').setStyle(1), // Primary
+            new ButtonBuilder().setCustomId(`custom-field-finish-${eventId}`).setLabel('Finish Adding Fields').setStyle(2) // Secondary
+          );
+
+        return interaction.reply({ content: `Custom field "**${fieldName}**" added. Add another or finish.`, components: [row], ephemeral: true });
+      } catch (customModalError) {
+        console.error('Error processing customFieldAddModal:', customModalError);
+        return interaction.reply({ content: 'Error adding custom field.', ephemeral: true });
+      }
+    }
+  } else if (interaction.isButton()) {
+    const customIdParts = interaction.customId.split('-');
+    const prefix = customIdParts[0];
+    const action = customIdParts[1];
+    const eventIdStr = customIdParts[2]; // This might be eventId or part of a more complex customId
+
+    if (prefix === 'rsvp' && eventIdStr) {
+      const eventId = parseInt(eventIdStr, 10);
+      const rsvpStatus = action; // 'going', 'interested', 'cantgo'
+      try {
+        await interaction.deferReply({ ephemeral: true });
+        const userId = interaction.user.id;
+        const event = await linkStore.getEventById(eventId);
+
+        if (!event || event.status !== 'published') {
+          return interaction.editReply({ content: 'This event is not available or no longer active for RSVPs.', ephemeral: true });
+        }
+
+        let newRsvpStatus = type;
+        let replyMessage = '';
+
+        if (type === 'cantgo') {
+          newRsvpStatus = 'cancelled_rsvp'; // Or simply remove their RSVP if they had one
+          await linkStore.addRsvp(eventId, userId, newRsvpStatus); // This will update counts
+          replyMessage = `You've indicated you can't go to **${event.title}**. Your RSVP has been updated.`;
+        } else {
+          // Check capacity for 'going'
+          if (type === 'going' && event.capacity > 0 && event.rsvp_count_going >= event.capacity) {
+            // Check if user is already 'going' - if so, it's fine. If not, they go to waitlist or get 'full' message.
+            const existingRsvp = await linkStore.getRsvp(eventId, userId);
+            if (!existingRsvp || existingRsvp.rsvp_status !== 'going') {
+                 // For now, just inform it's full. Waitlist is a future enhancement for this step.
+                return interaction.editReply({ content: `Sorry, event **${event.title}** has reached its capacity for 'Going' RSVPs. You can still mark yourself as 'Interested'.`, ephemeral: true });
+            }
+          }
+
+          await linkStore.addRsvp(eventId, userId, type); // 'going' or 'interested'
+          replyMessage = `You are now marked as **${type}** for event **${event.title}**!`;
+        }
+
+        // Optionally, try to update the original event message with new counts if message_id is stored
+        if (event.announcement_message_id && event.announcement_channel_id) {
+            try {
+                const channel = await client.channels.fetch(event.announcement_channel_id);
+                const message = await channel.messages.fetch(event.announcement_message_id);
+                const updatedEvent = await linkStore.getEventById(eventId); // Get latest counts
+
+                // Rebuild embed with new counts - requires buildEventEmbed from events.js or similar logic here
+                // For simplicity now, we won't rebuild the full embed, just acknowledge.
+                // A proper update would involve fetching ISLAND_DATA and using the buildEventEmbed logic.
+                // This part can be enhanced later.
+            } catch (msgUpdateError) {
+                warn(`Could not update event message ${event.announcement_message_id} with new RSVP counts:`, msgUpdateError.message);
+            }
+        }
+
+        return interaction.editReply({ content: replyMessage, ephemeral: true });
+
+      } catch (rsvpError) {
+        console.error(`Error processing RSVP button for event ${eventId}:`, rsvpError);
+        return interaction.editReply({ content: 'There was an error processing your RSVP. Please try again.', ephemeral: true }).catch(()=>{});
+      }
+    } else if (prefix === 'manage' && action === 'custom' && customIdParts[2] === 'fields' && customIdParts[3]) {
+        // manage-custom-fields-<eventId>
+        const eventId = parseInt(customIdParts[3], 10);
+        const { ModalBuilder, TextInputBuilder, ActionRowBuilder } = require('discord.js'); // Ensure they are in scope
+        const modal = new ModalBuilder()
+            .setCustomId(`customFieldAddModal-${eventId}`)
+            .setTitle(`Add Custom Field for Event #${eventId}`);
+        const nameInput = new TextInputBuilder().setCustomId('customFieldName').setLabel("Field Name").setStyle(1).setRequired(true);
+        const valueInput = new TextInputBuilder().setCustomId('customFieldValue').setLabel("Field Value").setStyle(2).setRequired(true);
+        const orderInput = new TextInputBuilder().setCustomId('customFieldDisplayOrder').setLabel("Display Order (Optional, e.g., 1, 2)").setStyle(1).setRequired(false);
+        modal.addComponents(new ActionRowBuilder().addComponents(nameInput), new ActionRowBuilder().addComponents(valueInput), new ActionRowBuilder().addComponents(orderInput));
+        await interaction.showModal(modal);
+        // The original interaction (button click) is ephemeral, so no explicit reply needed here as modal takes over.
+    } else if (prefix === 'custom' && action === 'field' && customIdParts[2] === 'finish' && customIdParts[3]) {
+        // custom-field-finish-<eventId>
+        const eventId = parseInt(customIdParts[3], 10);
+        await interaction.update({ content: `Finished adding custom fields for Event #${eventId}. You can publish or further edit the event.`, components: [], ephemeral: true });
+    }
+    // Other button interactions can be handled here
   }
 
 
-  // Slash Command Handling
+  // Slash Command Handling (ensure it's only for ChatInputCommands)
   if (!interaction.isChatInputCommand()) return;
 
   /* ─── Backend bereit? ─────────────────────────────── */
