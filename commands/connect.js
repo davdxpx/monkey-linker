@@ -73,7 +73,11 @@ module.exports = {
 
       // Already verified?
       if (row.verified) {
-        return interaction.editReply({ content: '✅ Your Discord account is already linked to this Roblox user.' });
+        const alreadyVerifiedEmbed = new EmbedBuilder()
+          .setColor(0x4CAF50) // SUCCESS_COLOR (Green)
+          .setTitle('✅ Already Linked')
+          .setDescription('Your Discord account is already linked to a Roblox user.'); // Removed specific roblox user mention as profile might not have been fetched yet
+        return interaction.editReply({ embeds: [alreadyVerifiedEmbed] });
       }
 
       // Cool‑down check for the /connect command (max 2 per 15 min)
@@ -85,7 +89,11 @@ module.exports = {
       }
       if (usage.count >= CMD_LIMIT) {
         const waitMin = Math.ceil((CMD_WINDOW - (now - usage.ts)) / 60000);
-        return interaction.editReply({ content: `⏳ Too many attempts. Please wait **${waitMin} min** and try again.` });
+        const cooldownEmbed = new EmbedBuilder()
+          .setColor(0xFFC107) // WARN_COLOR (Amber)
+          .setTitle('⏳ Too Many Attempts')
+          .setDescription(`You have used this command too frequently. Please wait **${waitMin} minute${waitMin > 1 ? 's' : ''}** and try again.`);
+        return interaction.editReply({ embeds: [cooldownEmbed] });
       }
       usage.count++;
       cmdUsage.set(discordId, usage);
