@@ -73,7 +73,7 @@ module.exports = {
       sc.setName('create')
         .setDescription('Create a new event (starts as draft).')
         .addAttachmentOption(o => o.setName('image_upload').setDescription('Upload an image for the event banner.').setRequired(false))
-        // Other details will be collected via a Modal.
+        .addStringOption(o => o.setName('use_template').setDescription('Name of an event template to use for pre-filling details.').setRequired(false))
     )
     .addSubcommand(sc =>
       sc.setName('publish')
@@ -108,6 +108,28 @@ module.exports = {
       sc.setName('rsvps')
         .setDescription('[Admin] View RSVPs for an event.')
         .addIntegerOption(o => o.setName('event_id').setDescription('The ID of the event.').setRequired(true))
+    )
+    .addSubcommandGroup(group =>
+      group.setName('template')
+        .setDescription('[Admin] Manage event templates.')
+        .addSubcommand(sub =>
+          sub.setName('create')
+            .setDescription('Create a new event template.')
+            .addStringOption(o => o.setName('name').setDescription('Unique name for this template.').setRequired(true))
+            .addIntegerOption(o => o.setName('from_event_id').setDescription('Optional: Event ID to base this template on.').setRequired(false))
+            // Potentially add more direct options if not basing on from_event_id, or use a modal
+        )
+        .addSubcommand(sub => sub.setName('list').setDescription('List all available event templates.'))
+        .addSubcommand(sub =>
+          sub.setName('view')
+            .setDescription('View a specific event template.')
+            .addStringOption(o => o.setName('name').setDescription('Name of the template to view.').setRequired(true))
+        )
+        .addSubcommand(sub =>
+          sub.setName('delete')
+            .setDescription('Delete an event template.')
+            .addStringOption(o => o.setName('name').setDescription('Name of the template to delete.').setRequired(true))
+        )
     ),
 
   async execute(interaction, linkStore, envConfig) { // Added linkStore and envConfig
@@ -121,16 +143,112 @@ module.exports = {
       }
 
       const sub = interaction.options.getSubcommand();
-      log('Subcmd:', sub);
+      const group = interaction.options.getSubcommandGroup(false); // false means it's optional
+      log('Group:', group, 'Subcmd:', sub);
 
       // Permission check for admin-only commands
-      const adminCommands = ['create', 'publish', 'delete', 'edit', 'rsvps']; // Added 'rsvps'
-      if (adminCommands.includes(sub) && !isEventAdmin(interaction, envConfig.ADMIN_ROLES)) {
-        const noPermsEmbed = new EmbedBuilder().setColor(0xE53935).setTitle('🚫 Permission Denied').setDescription('You do not have the required permissions to use this subcommand.');
-        return interaction.editReply({ embeds: [noPermsEmbed] });
+      // Template commands are also admin only.
+      const adminSubcommands = ['create', 'publish', 'delete', 'edit', 'rsvps'];
+      const adminGroups = ['template'];
+
+      if ((adminSubcommands.includes(sub) && !group) || (group && adminGroups.includes(group))) {
+          if (!isEventAdmin(interaction, envConfig.ADMIN_ROLES)) {
+            const noPermsEmbed = new EmbedBuilder().setColor(0xE53935).setTitle('🚫 Permission Denied').setDescription('You do not have the required permissions to use this command/subcommand.');
+            return interaction.editReply({ embeds: [noPermsEmbed] });
+          }
       }
 
-      /* ─────────── LIST ─────────── */
+
+      if (group === 'template') {
+        // Handle template subcommands
+        if (sub === 'create') {
+            const templateName = interaction.options.getString('name');
+            const fromEventId = interaction.options.getInteger('from_event_id');
+
+            let eventDataForTemplate = {};
+
+            if (fromEventId) {
+                const sourceEvent = await linkStore.getEventById(fromEventId);
+                if (!sourceEvent) {
+                    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Source Event Not Found').setDescription(`Event with ID #${fromEventId} not found to create template from.`)] });
+                }
+                // Select fields to include in template
+                eventDataForTemplate = {
+                    title: sourceEvent.title,
+                    description: sourceEvent.description,
+                    island_name: sourceEvent.island_name,
+                    area_name: sourceEvent.area_name,
+                    image_main_url: sourceEvent.image_main_url,
+                    capacity: sourceEvent.capacity,
+                    // We might want to also template custom fields and rewards
+                    // custom_fields: await linkStore.getEventCustomFields(fromEventId),
+                    // rewards: await linkStore.getEventRewards(fromEventId),
+                };
+            } else {
+                // If not from_event_id, admin needs to provide details.
+                // For now, we'll require from_event_id or make a very basic template.
+                // Or, this could trigger a modal to input template details.
+                // For this phase, let's assume if no from_event_id, it's a minimal template or error.
+                 return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('🚧 Under Development').setDescription('Creating templates without basing them on an existing event ID is not yet fully supported. Please provide a `from_event_id` for now.')] });
+            }
+
+            try {
+                await linkStore.createEventTemplate(templateName, interaction.user.id, JSON.stringify(eventDataForTemplate));
+                return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x4CAF50).setTitle('✅ Template Created').setDescription(`Event template "**${templateName}**" created successfully.`)] });
+            } catch (e) {
+                if (e.message.includes('UNIQUE constraint failed')) { // SQLite specific
+                    return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Error').setDescription(`A template with the name "**${templateName}**" already exists.`)] });
+                }
+                console.error("Error creating template:", e);
+                return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Error').setDescription('Could not create the event template.')] });
+            }
+        } else if (sub === 'list') {
+            const templates = await linkStore.getAllEventTemplates();
+            const listEmbed = new EmbedBuilder().setColor(0x00BCD4).setTitle('📋 Event Templates');
+            if (!templates || templates.length === 0) {
+                listEmbed.setDescription('No event templates found.');
+            } else {
+                listEmbed.setDescription('Here are the available event templates:');
+                templates.forEach(t => {
+                    listEmbed.addFields({ name: t.template_name, value: `ID: ${t.template_id}\nCreated by: <@${t.creator_discord_id}> on <t:${t.created_at}:D>` });
+                });
+            }
+            return interaction.editReply({ embeds: [listEmbed] });
+        } else if (sub === 'view') {
+            const templateName = interaction.options.getString('name');
+            const template = await linkStore.getEventTemplateByName(templateName);
+            if (!template) {
+                return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('🔎 Template Not Found').setDescription(`Template "**${templateName}**" not found.`)]});
+            }
+            const templateData = JSON.parse(template.event_data); // Assuming event_data is JSON string
+            const viewEmbed = new EmbedBuilder()
+                .setColor(0x00BCD4)
+                .setTitle(`📜 Template: ${template.template_name}`)
+                .setDescription(templateData.description || '_No description_')
+                .addFields(
+                    { name: 'Title Prefix (Example)', value: templateData.title || '_Not set_', inline: true },
+                    { name: 'Island', value: templateData.island_name || '_Not set_', inline: true },
+                    { name: 'Area', value: templateData.area_name || '_Not set_', inline: true },
+                    { name: 'Capacity', value: String(templateData.capacity || 0), inline: true },
+                    { name: 'Image URL', value: templateData.image_main_url || '_Not set_', inline: false },
+                    // Consider showing templated custom fields/rewards here too
+                )
+                .setFooter({ text: `Created by <@${template.creator_discord_id}> on <t:${template.created_at}:F>`});
+            return interaction.editReply({ embeds: [viewEmbed] });
+        } else if (sub === 'delete') {
+            const templateName = interaction.options.getString('name');
+            const result = await linkStore.deleteEventTemplateByName(templateName);
+            if (result) { // Assumes delete returns truthy on success (e.g., changes > 0 for SQLite)
+                 return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x4CAF50).setTitle('🗑️ Template Deleted').setDescription(`Template "**${templateName}**" deleted.`)]});
+            } else {
+                 return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Not Found').setDescription(`Template "**${templateName}**" not found or already deleted.`)]});
+            }
+        }
+        return; // End of template group handling
+      }
+
+
+      /* ─────────── LIST (Events) ─────────── */
       if (sub === 'list') {
         const publishedEvents = await linkStore.getPublishedEvents();
         const listEmbed = new EmbedBuilder().setTitle('📅 Upcoming Published Events').setColor(0x00bcd4).setTimestamp();
@@ -157,7 +275,22 @@ module.exports = {
       /* ─────────── CREATE ─────────── */
       if (sub === 'create') {
         const attachment = interaction.options.getAttachment('image_upload');
+        const templateName = interaction.options.getString('use_template');
         let uploadedImageUrl = null;
+        let templateData = {};
+
+        if (templateName) {
+            const template = await linkStore.getEventTemplateByName(templateName);
+            if (!template) {
+                return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Template Not Found').setDescription(`Event template "**${templateName}**" was not found.`)] });
+            }
+            try {
+                templateData = JSON.parse(template.event_data);
+            } catch (e) {
+                log(`Error parsing template data for ${templateName}:`, e);
+                return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Error').setDescription(`Could not parse data for template "**${templateName}**".`)] });
+            }
+        }
 
         if (attachment) {
           if (!envConfig.EVENT_ASSET_CHANNEL_ID) {
@@ -189,11 +322,39 @@ module.exports = {
         // Modal for event creation
         const modal = new ModalBuilder().setCustomId('eventCreateModal').setTitle('Create New Event (Draft)');
 
-        const titleInput = new TextInputBuilder().setCustomId('eventTitle').setLabel("Event Title").setStyle(1).setRequired(true); // Short
-        const descriptionInput = new TextInputBuilder().setCustomId('eventDescription').setLabel("Event Description").setStyle(2).setRequired(true); // Long
+        const titleInput = new TextInputBuilder().setCustomId('eventTitle').setLabel("Event Title").setStyle(1).setRequired(true);
+        if (templateData.title) titleInput.setValue(templateData.title);
+
+        const descriptionInput = new TextInputBuilder().setCustomId('eventDescription').setLabel("Event Description").setStyle(2).setRequired(true);
+        if (templateData.description) descriptionInput.setValue(templateData.description);
+
+        // Date and Time might not be templated directly, or admin needs to confirm/change them.
+        // For now, we won't pre-fill date/time from template as events are time-sensitive.
         const dateInput = new TextInputBuilder().setCustomId('eventDate').setLabel("Start Date (YYYY-MM-DD)").setStyle(1).setRequired(true).setPlaceholder('e.g., 2024-12-31');
         const timeInput = new TextInputBuilder().setCustomId('eventTime').setLabel("Start Time (HH:MM, 24hr format, UTC)").setStyle(1).setRequired(true).setPlaceholder('e.g., 17:30');
+
         const imageMainUrlInput = new TextInputBuilder().setCustomId('eventImageMainUrl').setLabel("Main Image URL (Optional)").setStyle(1).setRequired(false).setPlaceholder('https://example.com/image.png');
+        if (templateData.image_main_url && !uploadedImageUrl) { // Don't prefill if image was uploaded
+            imageMainUrlInput.setValue(templateData.image_main_url);
+        }
+        if (uploadedImageUrl) { // Inform user that uploaded image takes precedence
+            imageMainUrlInput.setPlaceholder(`Uploaded image will be used. You can optionally provide a URL to override it if the upload fails or is incorrect.`);
+        }
+
+
+        // Note: Templated island_name, area_name, capacity will be handled by modal submission logic if passed via pendingEventCreations or similar
+        // For now, the modal itself doesn't have these fields. They are placeholders in the modal handler.
+        // If templateData contains these, they should be stored in client.pendingEventCreations alongside attachmentUrl.
+        if (templateData.island_name || templateData.area_name || templateData.capacity) {
+            const currentPending = interaction.client.pendingEventCreations.get(interaction.user.id) || {};
+            interaction.client.pendingEventCreations.set(interaction.user.id, {
+                ...currentPending, // Keep attachmentUrl if it was set
+                templateIsland: templateData.island_name,
+                templateArea: templateData.area_name,
+                templateCapacity: templateData.capacity,
+            });
+        }
+
 
         modal.addComponents(
           new ActionRowBuilder().addComponents(titleInput),
@@ -218,6 +379,8 @@ module.exports = {
         }
         // Fetch and attach custom fields
         event.custom_fields = await linkStore.getEventCustomFields(eventId);
+        // Fetch and attach rewards
+        event.rewards = await linkStore.getEventRewards(eventId);
 
         const viewEmbed = buildEventEmbed(event, envConfig);
         return interaction.editReply({ embeds: [viewEmbed], ephemeral: event.status === 'draft' }); // Ephemeral if draft
@@ -248,6 +411,8 @@ module.exports = {
 
         // Fetch and attach custom fields for the announcement
         eventToPublish.custom_fields = await linkStore.getEventCustomFields(eventId);
+        // Fetch and attach rewards for the announcement
+        eventToPublish.rewards = await linkStore.getEventRewards(eventId);
 
         const announcementEmbed = buildEventEmbed(eventToPublish, envConfig);
 
@@ -319,8 +484,9 @@ module.exports = {
             .addComponents(
                 // Button to trigger a modal for basic info (title, desc, date, time) - Future Step
                 // new ButtonBuilder().setCustomId(`edit-event-basic-${eventId}`).setLabel('Edit Basic Info').setStyle(1),
-                new ButtonBuilder().setCustomId(`manage-custom-fields-${eventId}`).setLabel('Manage Custom Fields').setStyle(2), // Secondary
-                new ButtonBuilder().setCustomId(`edit-event-image-${eventId}`).setLabel('Change Image').setStyle(2) // Secondary (links to /events edit_image or similar modal)
+                new ButtonBuilder().setCustomId(`manage-custom-fields-${eventId}`).setLabel('Manage Custom Fields').setStyle(2),
+                new ButtonBuilder().setCustomId(`manage-event-rewards-${eventId}`).setLabel('Manage Rewards').setStyle(2), // New Button
+                new ButtonBuilder().setCustomId(`edit-event-image-${eventId}`).setLabel('Change Image').setStyle(2)
             );
 
         currentEventEmbed.setTitle(`✏️ Editing Event: ${eventToEdit.title} (ID #${eventId})`);
@@ -457,7 +623,19 @@ function buildEventEmbed(event, envConfig) { // envConfig might be useful for gl
   if (event.custom_fields && event.custom_fields.length > 0) {
     embed.addFields({ name: '\u200B', value: '**Additional Details:**' }); // Separator
     event.custom_fields.forEach(cf => {
-      embed.addFields({ name: cf.field_name, value: cf.field_value, inline: true });
+      embed.addFields({ name: cf.field_name, value: cf.field_value, inline: true }); // Keep inline true for now, or make it configurable
+    });
+  }
+
+  // Event Rewards display
+  if (event.rewards && event.rewards.length > 0) {
+    embed.addFields({ name: '\u200B', value: '**🎁 Event Rewards:**' }); // Separator
+    event.rewards.forEach(reward => {
+      let rewardValue = reward.description || '_No description_';
+      if (reward.image_url) { // Simple link for now, not inline image in field
+        rewardValue += `\n[View Image](${reward.image_url})`;
+      }
+      embed.addFields({ name: reward.name, value: rewardValue, inline: event.rewards.length > 1 }); // Inline if multiple rewards
     });
   }
 
