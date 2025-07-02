@@ -62,7 +62,9 @@ const {
   Collection,
   GatewayIntentBits,
   Partials,
+  EmbedBuilder, // Already added, but ensure it's here
 } = require('discord.js');
+const { migrateEventsJsonToDb, EVENTS_JSON_PATH } = require('./utils/migrateEvents.js');
 
 //-------------------------------------------------------------------
 // 3 · CLIENT SETUP
@@ -106,19 +108,81 @@ async function initSqlite(DB_PATH = './links.db') {
       err => err ? reject(err) : console.log('🗄️  SQLite opened:', DB_PATH)
     );
 
-    db.exec(`CREATE TABLE IF NOT EXISTS links (
-      discord      TEXT PRIMARY KEY,
-      roblox       INTEGER UNIQUE NOT NULL,
-      code         TEXT,
-      attempts     INTEGER DEFAULT 0,
-      lastAttempt  INTEGER DEFAULT 0,
-      verified     INTEGER DEFAULT 0,
-      created      INTEGER DEFAULT (strftime('%s','now'))
-    );`);
+    db.serialize(() => { // Serialize to ensure statements run in order
+      db.exec(`CREATE TABLE IF NOT EXISTS links (
+        discord      TEXT PRIMARY KEY,
+        roblox       INTEGER UNIQUE NOT NULL,
+        code         TEXT,
+        attempts     INTEGER DEFAULT 0,
+        lastAttempt  INTEGER DEFAULT 0,
+        verified     INTEGER DEFAULT 0,
+        created      INTEGER DEFAULT (strftime('%s','now'))
+      );`);
+
+      // New Event System Tables
+      db.exec(`CREATE TABLE IF NOT EXISTS events (
+          event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          title TEXT NOT NULL,
+          description TEXT,
+          creator_discord_id TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'draft', -- draft, published, archived, cancelled, active
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          start_at INTEGER NOT NULL,
+          end_at INTEGER,
+          island_name TEXT,
+          area_name TEXT,
+          image_main_url TEXT,
+          image_thumbnail_url TEXT,
+          capacity INTEGER DEFAULT 0,
+          rsvp_count_going INTEGER DEFAULT 0,
+          rsvp_count_interested INTEGER DEFAULT 0,
+          announcement_message_id TEXT,
+          announcement_channel_id TEXT,
+          is_recurring INTEGER DEFAULT 0,
+          recurrence_rule TEXT,
+          template_name TEXT
+      );`);
+
+      db.exec(`CREATE TABLE IF NOT EXISTS event_rsvps (
+          rsvp_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id INTEGER NOT NULL,
+          user_discord_id TEXT NOT NULL,
+          rsvp_status TEXT NOT NULL, -- 'going', 'interested', 'waitlisted', 'cancelled_rsvp'
+          rsvp_at INTEGER NOT NULL,
+          FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
+      );`);
+
+      db.exec(`CREATE TABLE IF NOT EXISTS event_custom_fields (
+          custom_field_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id INTEGER NOT NULL,
+          field_name TEXT NOT NULL,
+          field_value TEXT NOT NULL,
+          display_order INTEGER DEFAULT 0,
+          FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
+      );`);
+
+      db.exec(`CREATE TABLE IF NOT EXISTS event_templates (
+          template_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          template_name TEXT NOT NULL UNIQUE,
+          creator_discord_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          event_data TEXT NOT NULL -- JSON string
+      );`);
+
+      // Indexes for events
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_events_start_at ON events(start_at);`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_event_rsvps_event_id ON event_rsvps(event_id);`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_event_rsvps_user_id ON event_rsvps(user_discord_id);`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_event_custom_fields_event_id ON event_custom_fields(event_id);`);
+    });
 
     const sql = wrapSql(db);
 
-    const api = {
+    // Define the linkStore API methods
+    const linkStoreApi = {
+      // Link methods
       get:            d => sql.get('SELECT * FROM links WHERE discord=?', [d]),
       getByRb:        r => sql.get('SELECT * FROM links WHERE roblox=?',  [r]),
       upsert: ({ discord, roblox, code, attempts = 0, lastAttempt = 0, verified = 0 }) =>
@@ -137,13 +201,41 @@ async function initSqlite(DB_PATH = './links.db') {
         'DELETE FROM links WHERE verified=0 AND (strftime("%s","now")-created) > ?',
         [s]
       ),
+
+      // Event methods (SQLite implementations)
+      createEvent: (eventData) => {
+        const { title, description, creator_discord_id, status = 'draft', created_at, updated_at, start_at, end_at, island_name, area_name, image_main_url, image_thumbnail_url, capacity = 0 } = eventData;
+        return sql.run(
+          `INSERT INTO events (title, description, creator_discord_id, status, created_at, updated_at, start_at, end_at, island_name, area_name, image_main_url, image_thumbnail_url, capacity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [title, description, creator_discord_id, status, created_at, updated_at, start_at, end_at, island_name, area_name, image_main_url, image_thumbnail_url, capacity]
+        ).then(function() { return this.lastID; }); // Return the last inserted ID
+      },
+      getEventById: (eventId) => sql.get('SELECT * FROM events WHERE event_id = ?', [eventId]),
+      getPublishedEvents: (limit = 25) => sql.all('SELECT * FROM events WHERE status = ? ORDER BY start_at ASC LIMIT ?', ['published', limit]),
+      updateEventStatus: (eventId, status, updated_at) => sql.run('UPDATE events SET status = ?, updated_at = ? WHERE event_id = ?', [status, updated_at, eventId]),
+      deleteEvent: (eventId) => sql.run('DELETE FROM events WHERE event_id = ?', [eventId]),
+      updateEvent: (eventId, eventData) => {
+        // Construct SET clause dynamically for flexibility, ensure updated_at is always set
+        const fields = Object.keys(eventData).filter(k => k !== 'event_id'); // Don't update event_id
+        if (fields.length === 0) return Promise.resolve();
+        const setClause = fields.map(field => `${field} = ?`).join(', ');
+        const values = fields.map(field => eventData[field]);
+        values.push(Math.floor(Date.now() / 1000)); // updated_at
+        values.push(eventId);
+        return sql.run(`UPDATE events SET ${setClause}, updated_at = ? WHERE event_id = ?`, values);
+      },
+      // Placeholder for RSVP methods - to be implemented in Phase 2
+      addRsvp: (eventId, userId, rsvpStatus) => { /* ... */ },
+      getRsvpsForEvent: (eventId) => { /* ... */ },
     };
 
     // ⏰ Periodische Bereinigung: nicht verifizierte Links nach 15 min löschen
-    setInterval(() => api.cleanupExpired(900).catch(() => {}),
+    setInterval(() => linkStoreApi.cleanupExpired(900).catch(() => {}),
                 DBSYNC_INT_SEC * 1_000);
 
-    resolve(api);
+    // Pass the raw db object for migration before resolving with the API
+    resolve({ db, api: linkStoreApi, dbType: 'sqlite' });
   });
 }
 
@@ -161,22 +253,60 @@ async function initMongoBackend(cfg) {
   await client.connect();
   console.log('🍃  Mongo connected');
 
-  const col = client.db(cfg.MONGO_DB_NAME).collection('links');
+  const db = client.db(cfg.MONGO_DB_NAME);
+  const linksCol = db.collection('links');
 
-  return {
-    get:       d => col.findOne({ discord: d }),
-    getByRb:   r => col.findOne({ roblox: r }),
-    upsert:    row => col.updateOne({ discord: row.discord }, { $set: row }, { upsert: true }),
-    remove:    d => col.deleteOne({ discord: d }),
+  // Ensure indexes for new event collections in MongoDB
+  const eventsCol = db.collection('events');
+  await eventsCol.createIndex({ status: 1 });
+  await eventsCol.createIndex({ start_at: 1 });
+
+  const eventRsvpsCol = db.collection('event_rsvps');
+  await eventRsvpsCol.createIndex({ event_id: 1 });
+  await eventRsvpsCol.createIndex({ user_discord_id: 1 });
+
+  const eventCustomFieldsCol = db.collection('event_custom_fields');
+  await eventCustomFieldsCol.createIndex({ event_id: 1 });
+
+  const eventTemplatesCol = db.collection('event_templates');
+  await eventTemplatesCol.createIndex({ template_name: 1 }, { unique: true });
+
+  // Note: The linkStore API will need to be expanded to handle these new collections/tables.
+  const mongoApi = {
+    // Link methods
+    get:       d => linksCol.findOne({ discord: d }),
+    getByRb:   r => linksCol.findOne({ roblox: r }),
+    upsert:    row => linksCol.updateOne({ discord: row.discord }, { $set: row }, { upsert: true }),
+    remove:    d => linksCol.deleteOne({ discord: d }),
     setAttempts:(d, a, ts) => {
       const upd = { attempts: a };
       if (ts) upd.lastAttempt = ts;
-      return col.updateOne({ discord: d }, { $set: upd });
+      return linksCol.updateOne({ discord: d }, { $set: upd });
     },
-    verify:    d => col.updateOne({ discord: d }, { $set: { verified: 1 } }),
+    verify:    d => linksCol.updateOne({ discord: d }, { $set: { verified: 1 } }),
     cleanupExpired: s =>
-      col.deleteMany({ verified: 0, created: { $lt: Math.floor(Date.now() / 1000) - s } }),
+      linksCol.deleteMany({ verified: 0, created: { $lt: Math.floor(Date.now() / 1000) - s } }),
+
+    // Event methods (MongoDB implementations)
+    createEvent: async (eventData) => {
+      const result = await eventsCol.insertOne(eventData);
+      return result.insertedId;
+    },
+    getEventById: (eventId) => eventsCol.findOne({ _id: eventId }), // Assuming eventId is ObjectId for Mongo
+    getPublishedEvents: (limit = 25) => eventsCol.find({ status: 'published' }).sort({ start_at: 1 }).limit(limit).toArray(),
+    updateEventStatus: (eventId, status, updated_at) => eventsCol.updateOne({ _id: eventId }, { $set: { status, updated_at } }),
+    deleteEvent: (eventId) => eventsCol.deleteOne({ _id: eventId }),
+    updateEvent: (eventId, eventData) => {
+        const updatePayload = { ...eventData };
+        delete updatePayload._id; // Cannot update _id
+        updatePayload.updated_at = Math.floor(Date.now() / 1000);
+        return eventsCol.updateOne({ _id: eventId }, { $set: updatePayload });
+    },
+    // Placeholder for RSVP methods
+    addRsvp: (eventId, userId, rsvpStatus) => { /* ... */ },
+    getRsvpsForEvent: (eventId) => { /* ... */ },
   };
+  return { db, api: mongoApi, dbType: 'mongo' };
 }
 
 // ───────────────────────── Backend-Chooser ───────────────────────
@@ -233,7 +363,68 @@ async function registerCommands(list) {
 // 6 · INTERACTION HANDLER
 //-------------------------------------------------------------------
 client.on('interactionCreate', async interaction => {
-  // nur Chat-Slash-Commands
+  // Handle Modal Submissions for Event Creation
+  if (interaction.isModalSubmit() && interaction.customId === 'eventCreateModal') {
+    try {
+      // Defer update as interaction was already deferred by the /events create command
+      // await interaction.deferUpdate(); // or deferReply({ephemeral: true}) if the initial defer was not done
+
+      const title = interaction.fields.getTextInputValue('eventTitle');
+      const description = interaction.fields.getTextInputValue('eventDescription');
+      const dateStr = interaction.fields.getTextInputValue('eventDate');
+      const timeStr = interaction.fields.getTextInputValue('eventTime');
+      const imageMainUrl = interaction.fields.getTextInputValue('eventImageMainUrl') || null;
+
+      // TODO: Add island/area selection logic. For now, placeholders.
+      // This would typically involve another interaction step (select menu) after modal,
+      // or more fields in the modal if simple enough.
+      // For Phase 1 initial, we'll make them optional or have defaults.
+      const island_name = null; // Placeholder - to be properly implemented
+      const area_name = null;   // Placeholder
+
+      // Validate date and time (basic)
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr) || !/^\d{2}:\d{2}$/.test(timeStr)) {
+        return interaction.followUp({ content: 'Invalid date or time format. Please use YYYY-MM-DD and HH:MM (UTC).', ephemeral: true });
+      }
+      const start_at = Math.floor(new Date(`${dateStr}T${timeStr}:00.000Z`).getTime() / 1000); // Assume UTC
+      const now = Math.floor(Date.now() / 1000);
+
+      const eventData = {
+        title,
+        description,
+        creator_discord_id: interaction.user.id,
+        status: 'draft',
+        created_at: now,
+        updated_at: now,
+        start_at,
+        island_name, // From future selection
+        area_name,   // From future selection
+        image_main_url: imageMainUrl,
+        capacity: 0, // Default, can be updated via /edit
+      };
+
+      const eventId = await linkStore.createEvent(eventData);
+      const successEmbed = new EmbedBuilder()
+        .setColor(0x4CAF50) // SUCCESS_COLOR
+        .setTitle('🎉 Event Draft Created!')
+        .setDescription(`Your event draft "**${title}**" has been created with ID #${eventId}.`)
+        .addFields({ name: 'Next Steps', value: `Use \`/events publish event_id:${eventId}\` to announce it.\nYou can also use \`/events edit event_id:${eventId}\` to further refine details or add location.` })
+        .setTimestamp();
+      // The initial reply from /events create was deferred. We need to edit that.
+      // The interaction object here is for the modal submit.
+      // We need to find the original interaction if we want to edit its reply.
+      // However, the /events create command itself deferred its reply.
+      // It's simpler to send a new ephemeral followup from the modal.
+      return interaction.reply({ embeds: [successEmbed], ephemeral: true });
+
+    } catch (modalError) {
+      console.error('Error processing eventCreateModal:', modalError);
+      return interaction.reply({ content: 'There was an error creating your event draft from the modal. Please try again.', ephemeral: true }).catch(()=>{});
+    }
+  }
+
+
+  // Slash Command Handling
   if (!interaction.isChatInputCommand()) return;
 
   /* ─── Backend bereit? ─────────────────────────────── */
@@ -353,9 +544,20 @@ process.on('uncaughtException' , e => console.error('UncaughtException', e));
 (async () => {
   try {
     // 1) Backend wählen und initialisieren
-    linkStore = await selectBackend();      // globale Referenz füllen
+    const backend = await selectBackend(); // Returns { db, api, dbType } for SQLite, or { db: mongoDbObject, api, dbType: 'mongo'} for Mongo
+    linkStore = backend.api; // The API for commands to use
 
-    // 2) Commands von der Disk laden → client.commands wird befüllt
+    // 2) Run event migration if needed
+    if (fs.existsSync(EVENTS_JSON_PATH)) {
+      console.log('[Startup] Found events.json, attempting migration...');
+      // For SQLite, backend.db is the sqlite3.Database instance
+      // For MongoDB, backend.db is the MongoClient.Db instance
+      await migrateEventsJsonToDb(backend.db, backend.dbType);
+    } else {
+      console.log('[Startup] events.json not found, skipping migration.');
+    }
+
+    // 3) Commands von der Disk laden → client.commands wird befüllt
     const cmdList = loadCommands();
 
     // 3) Nach Discord-Login: Slash-Commands registrieren
