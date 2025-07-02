@@ -484,8 +484,9 @@ module.exports = {
             .addComponents(
                 // Button to trigger a modal for basic info (title, desc, date, time) - Future Step
                 // new ButtonBuilder().setCustomId(`edit-event-basic-${eventId}`).setLabel('Edit Basic Info').setStyle(1),
+                new ButtonBuilder().setCustomId(`edit-location-${eventId}`).setLabel('Change Location').setStyle(1), // Primary style for location
                 new ButtonBuilder().setCustomId(`manage-custom-fields-${eventId}`).setLabel('Manage Custom Fields').setStyle(2),
-                new ButtonBuilder().setCustomId(`manage-event-rewards-${eventId}`).setLabel('Manage Rewards').setStyle(2), // New Button
+                new ButtonBuilder().setCustomId(`manage-event-rewards-${eventId}`).setLabel('Manage Rewards').setStyle(2),
                 new ButtonBuilder().setCustomId(`edit-event-image-${eventId}`).setLabel('Change Image').setStyle(2)
             );
 
