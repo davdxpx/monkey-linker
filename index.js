@@ -62,7 +62,12 @@ const {
   Collection,
   GatewayIntentBits,
   Partials,
-  EmbedBuilder, // Already added, but ensure it's here
+  EmbedBuilder,
+  ActionRowBuilder,    // Added
+  ButtonBuilder,       // Added (already used but good to ensure it's explicitly here)
+  StringSelectMenuBuilder, // Added
+  ModalBuilder,          // Added (already used but good to ensure it's explicitly here)
+  TextInputBuilder,      // Added (already used but good to ensure it's explicitly here)
 } = require('discord.js');
 const { migrateEventsJsonToDb, EVENTS_JSON_PATH } = require('./utils/migrateEvents.js');
 
@@ -667,18 +672,55 @@ client.on('interactionCreate', async interaction => {
         .setColor(0x4CAF50) // SUCCESS_COLOR
         .setTitle('🎉 Event Draft Created!')
         .setDescription(`Your event draft "**${title}**" has been created with ID #${eventId}.`)
-        .addFields({ name: 'Next Steps', value: `Use \`/events publish event_id:${eventId}\` to announce it.\nYou can also use \`/events edit event_id:${eventId}\` to further refine details, add location, or manage custom fields.` })
         .setTimestamp();
 
-      const actionRow = new ActionRowBuilder()
-        .addComponents(
-            new ButtonBuilder()
-                .setCustomId(`manage-custom-fields-${eventId}`)
-                .setLabel('Manage Custom Fields')
-                .setStyle(2) // Secondary
-        );
+      const components = [];
+      const { ISLAND_DATA } = require('./utils/gameData.js'); // Ensure ISLAND_DATA is available
 
-      await interaction.reply({ embeds: [successEmbed], components: [actionRow], ephemeral: true });
+      // Determine next step: Location selection or just custom fields/rewards
+      if (!island_name) { // Island not set by template, ask user
+        successEmbed.addFields({ name: 'Next Step: Location', value: 'Please select the island for your event below.'});
+        const islandOptions = Object.keys(ISLAND_DATA).map(key => ({
+            label: `${ISLAND_DATA[key].emoji} ${key}`,
+            value: key,
+        }));
+        const islandSelectMenu = new StringSelectMenuBuilder()
+            .setCustomId(`select-island-${eventId}`)
+            .setPlaceholder('Select an island...')
+            .addOptions(islandOptions);
+        components.push(new ActionRowBuilder().addComponents(islandSelectMenu));
+      } else if (!area_name) { // Island set by template, but area is not
+        successEmbed.addFields({ name: 'Next Step: Area', value: `Island "**${island_name}**" set from template. Please select the area below.`});
+        const areas = ISLAND_DATA[island_name]?.areas || [];
+        if (areas.length > 0) {
+            const areaOptions = areas.map(area => ({ label: area, value: area }));
+            const areaSelectMenu = new StringSelectMenuBuilder()
+                .setCustomId(`select-area-${eventId}-${island_name}`) // Include island_name for context
+                .setPlaceholder('Select an area...')
+                .addOptions(areaOptions);
+            components.push(new ActionRowBuilder().addComponents(areaSelectMenu));
+        } else {
+             successEmbed.addFields({ name: 'Location Note', value: `Island "**${island_name}**" set. No specific areas defined for this island, or an issue occurred.`});
+        }
+      } else { // Both island and area were set by template
+         successEmbed.addFields({ name: 'Location Set', value: `Location **${island_name} - ${area_name}** set from template.`});
+      }
+
+      // Always add manage custom fields/rewards buttons if location part is done or was pre-filled
+      if (island_name && area_name) { // Or if no location step was needed
+        successEmbed.addFields({ name: 'Further Setup', value: `You can now publish the event or manage custom fields/rewards.` });
+      }
+
+      // Add buttons for custom fields and rewards
+      const manageButtonsRow = new ActionRowBuilder()
+        .addComponents(
+            new ButtonBuilder().setCustomId(`manage-custom-fields-${eventId}`).setLabel('Manage Custom Fields').setStyle(2),
+            new ButtonBuilder().setCustomId(`manage-event-rewards-${eventId}`).setLabel('Manage Rewards').setStyle(2)
+        );
+      components.push(manageButtonsRow);
+
+
+      await interaction.reply({ embeds: [successEmbed], components: components, ephemeral: true });
 
       if (pendingData) {
         client.pendingEventCreations.delete(interaction.user.id); // Clean up
@@ -823,11 +865,31 @@ client.on('interactionCreate', async interaction => {
         // The original interaction (button click) is ephemeral, so no explicit reply needed here as modal takes over.
     } else if (prefix === 'custom' && action === 'field' && customIdParts[2] === 'finish' && customIdParts[3]) {
         // custom-field-finish-<eventId>
-        const eventId = parseInt(customIdParts[3], 10);
-        await interaction.update({ content: `Finished adding custom fields for Event #${eventId}. You can publish or further edit the event.`, components: [], ephemeral: true });
+        const eventIdCf = parseInt(customIdParts[3], 10); // Renamed to avoid conflict
+        await interaction.update({ content: `Finished adding custom fields for Event #${eventIdCf}. You can publish or further edit the event.`, components: [], ephemeral: true });
+    } else if (prefix === 'edit' && action === 'location' && eventIdStr) {
+        // edit-location-<eventId>
+        const eventId = parseInt(eventIdStr, 10);
+        const { ISLAND_DATA } = require('./utils/gameData.js');
+        const islandOptions = Object.keys(ISLAND_DATA).map(key => ({
+            label: `${ISLAND_DATA[key].emoji} ${key}`,
+            value: key,
+        }));
+        const islandSelectMenu = new StringSelectMenuBuilder()
+            .setCustomId(`select-island-${eventId}`)
+            .setPlaceholder('Select a new island...')
+            .addOptions(islandOptions);
+        const row = new ActionRowBuilder().addComponents(islandSelectMenu);
+        // This is a button click, so we need to reply or update.
+        // Since the original /events edit is ephemeral, this should be an update to that interaction or a new ephemeral reply.
+        // interaction.update is for the component's message. If the original /events edit reply had components, this would update it.
+        // If it was just an embed, we might need to send a new message or ensure the original interaction can be updated.
+        // For simplicity with ephemeral, we can use editReply on the button's interaction.
+        await interaction.update({ content: `Changing location for Event #${eventId}. Please select the new island.`, embeds: [], components: [row], ephemeral: true });
+
     } else if (prefix === 'manage' && action === 'event' && customIdParts[2] === 'rewards' && customIdParts[3]) {
         // manage-event-rewards-<eventId>
-        const eventId = parseInt(customIdParts[3], 10);
+        const eventId = parseInt(customIdParts[3], 10); // Renamed to avoid conflict
         const { ModalBuilder, TextInputBuilder, ActionRowBuilder } = require('discord.js');
         const modal = new ModalBuilder()
             .setCustomId(`eventRewardAddModal-${eventId}`)
@@ -850,6 +912,69 @@ client.on('interactionCreate', async interaction => {
         await interaction.update({ content: `Finished adding rewards for Event #${eventId}.`, components: [], ephemeral: true });
     }
     // Other button interactions can be handled here
+  } else if (interaction.isStringSelectMenu()) {
+    const { ISLAND_DATA } = require('./utils/gameData.js'); // Ensure ISLAND_DATA is available
+    const customIdParts = interaction.customId.split('-');
+    const type = customIdParts[0]; // 'select'
+    const entity = customIdParts[1]; // 'island' or 'area'
+    const eventId = parseInt(customIdParts[2], 10);
+
+    if (entity === 'island' && eventId) {
+        try {
+            const selectedIsland = interaction.values[0];
+            await linkStore.updateEvent(eventId, { island_name: selectedIsland });
+
+            const areas = ISLAND_DATA[selectedIsland]?.areas || [];
+            let followupComponents = [];
+            let followupMessage = `Island set to **${selectedIsland}** for Event #${eventId}.`;
+
+            if (areas.length > 0) {
+                const areaOptions = areas.map(area => ({ label: area, value: area }));
+                const areaSelectMenu = new StringSelectMenuBuilder()
+                    .setCustomId(`select-area-${eventId}-${selectedIsland}`)
+                    .setPlaceholder('Select an area...')
+                    .addOptions(areaOptions);
+                followupComponents.push(new ActionRowBuilder().addComponents(areaSelectMenu));
+                followupMessage += '\nNow, please select the area for the event.';
+            } else {
+                followupMessage += '\nNo specific areas defined for this island. Location set.';
+                // If no areas, we might offer custom fields/rewards buttons again, or just confirm.
+                 const manageButtonsRow = new ActionRowBuilder()
+                    .addComponents(
+                        new ButtonBuilder().setCustomId(`manage-custom-fields-${eventId}`).setLabel('Manage Custom Fields').setStyle(2),
+                        new ButtonBuilder().setCustomId(`manage-event-rewards-${eventId}`).setLabel('Manage Rewards').setStyle(2)
+                    );
+                followupComponents.push(manageButtonsRow);
+            }
+            // Update the message that contained the island select menu
+            await interaction.update({ content: followupMessage, components: followupComponents, ephemeral: true });
+
+        } catch (islandSelectError) {
+            console.error(`Error processing island select for event ${eventId}:`, islandSelectError);
+            await interaction.update({ content: 'There was an error setting the island. Please try again.', components: [], ephemeral: true }).catch(()=>{});
+        }
+    } else if (entity === 'area' && eventId) {
+        try {
+            const selectedArea = interaction.values[0];
+            // islandName might be part of customIdParts[3] if needed for context, e.g. customId: select-area-<eventId>-<islandName>
+            // const islandName = customIdParts[3];
+            await linkStore.updateEvent(eventId, { area_name: selectedArea });
+
+            let finalMessage = `Location set to area **${selectedArea}** for Event #${eventId}. All main details set!`;
+
+            // Offer custom fields/rewards buttons
+            const manageButtonsRow = new ActionRowBuilder()
+                .addComponents(
+                    new ButtonBuilder().setCustomId(`manage-custom-fields-${eventId}`).setLabel('Manage Custom Fields').setStyle(2),
+                    new ButtonBuilder().setCustomId(`manage-event-rewards-${eventId}`).setLabel('Manage Rewards').setStyle(2)
+                );
+
+            await interaction.update({ content: finalMessage, components: [manageButtonsRow], ephemeral: true });
+        } catch (areaSelectError) {
+            console.error(`Error processing area select for event ${eventId}:`, areaSelectError);
+            await interaction.update({ content: 'There was an error setting the area. Please try again.', components: [], ephemeral: true }).catch(()=>{});
+        }
+    }
   }
 
 
