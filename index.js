@@ -177,6 +177,18 @@ async function initSqlite(DB_PATH = './links.db') {
       db.exec(`CREATE INDEX IF NOT EXISTS idx_event_rsvps_event_id ON event_rsvps(event_id);`);
       db.exec(`CREATE INDEX IF NOT EXISTS idx_event_rsvps_user_id ON event_rsvps(user_discord_id);`);
       db.exec(`CREATE INDEX IF NOT EXISTS idx_event_custom_fields_event_id ON event_custom_fields(event_id);`);
+
+      // Event Rewards Table
+      db.exec(`CREATE TABLE IF NOT EXISTS event_rewards (
+          reward_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id INTEGER NOT NULL,
+          name TEXT NOT NULL,
+          description TEXT,
+          image_url TEXT,
+          display_order INTEGER DEFAULT 0,
+          FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
+      );`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_event_rewards_event_id ON event_rewards(event_id);`);
     });
 
     const sql = wrapSql(db);
@@ -215,7 +227,12 @@ async function initSqlite(DB_PATH = './links.db') {
       getEventById: (eventId) => sql.get('SELECT * FROM events WHERE event_id = ?', [eventId]),
       getPublishedEvents: (limit = 25) => sql.all('SELECT * FROM events WHERE status = ? ORDER BY start_at ASC LIMIT ?', ['published', limit]),
       updateEventStatus: (eventId, status, updated_at) => sql.run('UPDATE events SET status = ?, updated_at = ? WHERE event_id = ?', [status, updated_at, eventId]),
-      deleteEvent: (eventId) => sql.run('DELETE FROM events WHERE event_id = ?', [eventId]),
+      deleteEvent: async function(eventId) { // Use function keyword for 'this' context
+        await this.deleteEventCustomFieldsByEventId(eventId);
+        await this.deleteEventRsvpsByEventId(eventId);
+        await this.deleteEventRewardsByEventId(eventId); // Now include this
+        return sql.run('DELETE FROM events WHERE event_id = ?', [eventId]);
+      },
       updateEvent: (eventId, eventData) => {
         // Construct SET clause dynamically for flexibility, ensure updated_at is always set
         const fields = Object.keys(eventData).filter(k => k !== 'event_id'); // Don't update event_id
@@ -258,6 +275,9 @@ async function initSqlite(DB_PATH = './links.db') {
         }
         return sql.all('SELECT * FROM event_rsvps WHERE event_id = ? ORDER BY rsvp_at ASC', [eventId]);
       },
+      deleteEventRsvpsByEventId: (eventId) => { // Added for cascading delete
+        return sql.run('DELETE FROM event_rsvps WHERE event_id = ?', [eventId]);
+      },
 
       // Custom Field Methods (SQLite)
       addEventCustomField: (eventId, fieldName, fieldValue, displayOrder = 0) => { // Renamed for clarity
@@ -284,6 +304,55 @@ async function initSqlite(DB_PATH = './links.db') {
       },
       deleteEventCustomFieldsByEventId: (eventId) => { // Renamed for clarity
         return sql.run('DELETE FROM event_custom_fields WHERE event_id = ?', [eventId]);
+      },
+
+      // Event Reward Methods (SQLite)
+      addEventReward: (eventId, name, description, imageUrl, displayOrder = 0) => {
+        return sql.run(
+          `INSERT INTO event_rewards (event_id, name, description, image_url, display_order) VALUES (?, ?, ?, ?, ?)`,
+          [eventId, name, description, imageUrl, displayOrder]
+        ).then(function() { return this.lastID; });
+      },
+      getEventRewards: (eventId) => {
+        return sql.all('SELECT * FROM event_rewards WHERE event_id = ? ORDER BY display_order ASC, reward_id ASC', [eventId]);
+      },
+      updateEventReward: (rewardId, name, description, imageUrl, displayOrder) => {
+        const updates = [];
+        const values = [];
+        if (name !== undefined) { updates.push('name = ?'); values.push(name); }
+        if (description !== undefined) { updates.push('description = ?'); values.push(description); }
+        if (imageUrl !== undefined) { updates.push('image_url = ?'); values.push(imageUrl); }
+        if (displayOrder !== undefined) { updates.push('display_order = ?'); values.push(displayOrder); }
+        if (updates.length === 0) return Promise.resolve();
+        values.push(rewardId);
+        return sql.run(`UPDATE event_rewards SET ${updates.join(', ')} WHERE reward_id = ?`, values);
+      },
+      deleteEventReward: (rewardId) => {
+        return sql.run('DELETE FROM event_rewards WHERE reward_id = ?', [rewardId]);
+      },
+      deleteEventRewardsByEventId: (eventId) => {
+        return sql.run('DELETE FROM event_rewards WHERE event_id = ?', [eventId]);
+      },
+
+      // Event Template Methods (SQLite)
+      createEventTemplate: (templateName, creatorId, eventDataJson) => {
+        const createdAt = Math.floor(Date.now() / 1000);
+        return sql.run(
+          `INSERT INTO event_templates (template_name, creator_discord_id, created_at, event_data) VALUES (?, ?, ?, ?)`,
+          [templateName, creatorId, createdAt, eventDataJson]
+        ).then(function() { return this.lastID; });
+      },
+      getEventTemplateByName: (templateName) => {
+        return sql.get('SELECT * FROM event_templates WHERE template_name = ?', [templateName]);
+      },
+      getEventTemplateById: (templateId) => { // Added for completeness
+        return sql.get('SELECT * FROM event_templates WHERE template_id = ?', [templateId]);
+      },
+      getAllEventTemplates: () => {
+        return sql.all('SELECT template_id, template_name, creator_discord_id, created_at FROM event_templates ORDER BY template_name ASC'); // Don't fetch full event_data for list
+      },
+      deleteEventTemplateByName: (templateName) => {
+        return sql.run('DELETE FROM event_templates WHERE template_name = ?', [templateName]);
       }
     };
 
@@ -328,6 +397,9 @@ async function initMongoBackend(cfg) {
   const eventTemplatesCol = db.collection('event_templates');
   await eventTemplatesCol.createIndex({ template_name: 1 }, { unique: true });
 
+  const eventRewardsCol = db.collection('event_rewards');
+  await eventRewardsCol.createIndex({ event_id: 1 });
+
   // Note: The linkStore API will need to be expanded to handle these new collections/tables.
   const mongoApi = {
     // Link methods
@@ -352,7 +424,12 @@ async function initMongoBackend(cfg) {
     getEventById: (eventId) => eventsCol.findOne({ _id: eventId }), // Assuming eventId is ObjectId for Mongo
     getPublishedEvents: (limit = 25) => eventsCol.find({ status: 'published' }).sort({ start_at: 1 }).limit(limit).toArray(),
     updateEventStatus: (eventId, status, updated_at) => eventsCol.updateOne({ _id: eventId }, { $set: { status, updated_at } }),
-    deleteEvent: (eventId) => eventsCol.deleteOne({ _id: eventId }),
+    deleteEvent: async function(eventId) { // Use function keyword for 'this' context
+        await this.deleteEventCustomFieldsByEventId(eventId);
+        await this.deleteEventRsvpsByEventId(eventId);
+        // Future: await this.deleteEventRewardsByEventId(eventId);
+        return eventsCol.deleteOne({ _id: eventId }); // Ensure eventId is ObjectId if needed for direct _id match
+    },
     updateEvent: (eventId, eventData) => {
         const updatePayload = { ...eventData };
         delete updatePayload._id; // Cannot update _id
@@ -385,6 +462,9 @@ async function initMongoBackend(cfg) {
         }
         return eventRsvpsCol.find(query).sort({ rsvp_at: 1 }).toArray();
     },
+    deleteEventRsvpsByEventId: (eventId) => { // Added for cascading delete
+        return eventRsvpsCol.deleteMany({ event_id: eventId });
+    },
 
     // Custom Field Methods (MongoDB)
     addEventCustomField: async (eventId, fieldName, fieldValue, displayOrder = 0) => { // Renamed
@@ -410,6 +490,71 @@ async function initMongoBackend(cfg) {
     },
     deleteEventCustomFieldsByEventId: (eventId) => { // Renamed
         return eventCustomFieldsCol.deleteMany({ event_id: eventId });
+    },
+
+    // Event Reward Methods (MongoDB)
+    addEventReward: async (eventId, name, description, imageUrl, displayOrder = 0) => {
+        const result = await eventRewardsCol.insertOne({ event_id: eventId, name, description, image_url: imageUrl, display_order: displayOrder });
+        return result.insertedId;
+    },
+    getEventRewards: (eventId) => {
+        return eventRewardsCol.find({ event_id: eventId }).sort({ display_order: 1, _id: 1 }).toArray();
+    },
+    updateEventReward: (rewardId, name, description, imageUrl, displayOrder) => {
+        const updates = {};
+        if (name !== undefined) updates.name = name;
+        if (description !== undefined) updates.description = description;
+        if (imageUrl !== undefined) updates.image_url = imageUrl;
+        if (displayOrder !== undefined) updates.display_order = displayOrder;
+        if (Object.keys(updates).length === 0) return Promise.resolve();
+        const { ObjectId } = require('mongodb');
+        return eventRewardsCol.updateOne({ _id: new ObjectId(rewardId) }, { $set: updates });
+    },
+    deleteEventReward: (rewardId) => {
+        const { ObjectId } = require('mongodb');
+        return eventRewardsCol.deleteOne({ _id: new ObjectId(rewardId) });
+    },
+    deleteEventRewardsByEventId: (eventId) => {
+        return eventRewardsCol.deleteMany({ event_id: eventId });
+    },
+
+    // Event Template Methods (MongoDB)
+    createEventTemplate: async (templateName, creatorId, eventDataJson) => {
+        const createdAt = Math.floor(Date.now() / 1000);
+        // Parse JSON string to object for MongoDB storage, or store as string if preferred
+        let event_data_obj = eventDataJson;
+        try {
+            event_data_obj = JSON.parse(eventDataJson);
+        } catch (e) { /* keep as string if not valid JSON, or handle error */ }
+
+        const result = await eventTemplatesCol.insertOne({
+            template_name: templateName,
+            creator_discord_id: creatorId,
+            created_at: createdAt,
+            event_data: event_data_obj
+        });
+        return result.insertedId;
+    },
+    getEventTemplateByName: async (templateName) => {
+        const template = await eventTemplatesCol.findOne({ template_name: templateName });
+        if (template && typeof template.event_data !== 'string') { // Ensure event_data is stringified if it was stored as object
+            template.event_data = JSON.stringify(template.event_data);
+        }
+        return template;
+    },
+    getEventTemplateById: async (templateId) => { // Added for completeness
+        const { ObjectId } = require('mongodb');
+        const template = await eventTemplatesCol.findOne({ _id: new ObjectId(templateId) });
+         if (template && typeof template.event_data !== 'string') {
+            template.event_data = JSON.stringify(template.event_data);
+        }
+        return template;
+    },
+    getAllEventTemplates: () => {
+        return eventTemplatesCol.find({}, { projection: { event_data: 0 } }).sort({ template_name: 1 }).toArray(); // Exclude event_data from list
+    },
+    deleteEventTemplateByName: (templateName) => {
+        return eventTemplatesCol.deleteOne({ template_name: templateName });
     }
   };
   return { db, api: mongoApi, dbType: 'mongo' };
@@ -479,18 +624,22 @@ client.on('interactionCreate', async interaction => {
       const timeStr = interaction.fields.getTextInputValue('eventTime');
       let imageMainUrl = interaction.fields.getTextInputValue('eventImageMainUrl') || null; // From modal
 
-      // Check if there was a pre-uploaded image from the command
+      // Check if there was a pre-uploaded image or template data from the command
       const pendingData = client.pendingEventCreations.get(interaction.user.id);
       if (pendingData && pendingData.attachmentUrl) {
         imageMainUrl = pendingData.attachmentUrl; // Prioritize uploaded image
       }
 
-      // TODO: Add island/area selection logic. For now, placeholders.
-      // This would typically involve another interaction step (select menu) after modal,
-      // or more fields in the modal if simple enough.
-      // For Phase 1 initial, we'll make them optional or have defaults.
-      const island_name = null; // Placeholder - to be properly implemented
-      const area_name = null;   // Placeholder
+      let island_name = null;
+      let area_name = null;
+      let capacity = 0;
+
+      if (pendingData && pendingData.templateIsland) island_name = pendingData.templateIsland;
+      if (pendingData && pendingData.templateArea) area_name = pendingData.templateArea;
+      if (pendingData && pendingData.templateCapacity) capacity = parseInt(pendingData.templateCapacity, 10) || 0;
+
+      // TODO: Add island/area selection UI logic. For now, using template or null.
+      // This would typically involve another interaction step (select menu) after modal.
 
       // Validate date and time (basic)
       if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr) || !/^\d{2}:\d{2}$/.test(timeStr)) {
@@ -507,10 +656,10 @@ client.on('interactionCreate', async interaction => {
         created_at: now,
         updated_at: now,
         start_at,
-        island_name, // From future selection
-        area_name,   // From future selection
+        island_name,
+        area_name,
         image_main_url: imageMainUrl,
-        capacity: 0, // Default, can be updated via /edit
+        capacity: capacity,
       };
 
       const eventId = await linkStore.createEvent(eventData);
@@ -568,6 +717,33 @@ client.on('interactionCreate', async interaction => {
       } catch (customModalError) {
         console.error('Error processing customFieldAddModal:', customModalError);
         return interaction.reply({ content: 'Error adding custom field.', ephemeral: true });
+      }
+    } else if (interaction.customId.startsWith('eventRewardAddModal-')) {
+      try {
+        const eventId = parseInt(interaction.customId.split('-')[1], 10);
+        const name = interaction.fields.getTextInputValue('rewardName');
+        const description = interaction.fields.getTextInputValue('rewardDescription') || null;
+        const imageUrl = interaction.fields.getTextInputValue('rewardImageUrl') || null;
+        const displayOrderStr = interaction.fields.getTextInputValue('rewardDisplayOrder');
+        const displayOrder = displayOrderStr ? parseInt(displayOrderStr, 10) : 0;
+
+        if (!name) {
+          return interaction.reply({ content: 'Reward Name is required.', ephemeral: true });
+        }
+
+        await linkStore.addEventReward(eventId, name, description, imageUrl, displayOrder || 0);
+
+        const { ButtonBuilder, ActionRowBuilder } = require('discord.js'); // Ensure in scope
+        const row = new ActionRowBuilder()
+          .addComponents(
+            new ButtonBuilder().setCustomId(`manage-event-rewards-${eventId}`).setLabel('Add Another Reward').setStyle(1),
+            new ButtonBuilder().setCustomId(`reward-finish-${eventId}`).setLabel('Finish Adding Rewards').setStyle(2)
+          );
+
+        return interaction.reply({ content: `Reward "**${name}**" added. Add another or finish.`, components: [row], ephemeral: true });
+      } catch (rewardModalError) {
+        console.error('Error processing eventRewardAddModal:', rewardModalError);
+        return interaction.reply({ content: 'Error adding reward.', ephemeral: true });
       }
     }
   } else if (interaction.isButton()) {
@@ -649,6 +825,29 @@ client.on('interactionCreate', async interaction => {
         // custom-field-finish-<eventId>
         const eventId = parseInt(customIdParts[3], 10);
         await interaction.update({ content: `Finished adding custom fields for Event #${eventId}. You can publish or further edit the event.`, components: [], ephemeral: true });
+    } else if (prefix === 'manage' && action === 'event' && customIdParts[2] === 'rewards' && customIdParts[3]) {
+        // manage-event-rewards-<eventId>
+        const eventId = parseInt(customIdParts[3], 10);
+        const { ModalBuilder, TextInputBuilder, ActionRowBuilder } = require('discord.js');
+        const modal = new ModalBuilder()
+            .setCustomId(`eventRewardAddModal-${eventId}`)
+            .setTitle(`Add Reward for Event #${eventId}`);
+        const nameInput = new TextInputBuilder().setCustomId('rewardName').setLabel("Reward Name").setStyle(1).setRequired(true);
+        const descriptionInput = new TextInputBuilder().setCustomId('rewardDescription').setLabel("Description (Optional)").setStyle(2).setRequired(false);
+        const imageUrlInput = new TextInputBuilder().setCustomId('rewardImageUrl').setLabel("Image URL (Optional, for icon)").setStyle(1).setRequired(false);
+        const orderInput = new TextInputBuilder().setCustomId('rewardDisplayOrder').setLabel("Display Order (Optional)").setStyle(1).setRequired(false);
+
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(nameInput),
+            new ActionRowBuilder().addComponents(descriptionInput),
+            new ActionRowBuilder().addComponents(imageUrlInput),
+            new ActionRowBuilder().addComponents(orderInput)
+        );
+        await interaction.showModal(modal);
+    } else if (prefix === 'reward' && action === 'finish' && customIdParts[2]) {
+        // reward-finish-<eventId>
+        const eventId = parseInt(customIdParts[2], 10);
+        await interaction.update({ content: `Finished adding rewards for Event #${eventId}.`, components: [], ephemeral: true });
     }
     // Other button interactions can be handled here
   }
