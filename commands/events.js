@@ -72,7 +72,8 @@ module.exports = {
     .addSubcommand(sc =>
       sc.setName('create')
         .setDescription('Create a new event (starts as draft).')
-        // Basic fields will be collected via a Modal for better UX
+        .addAttachmentOption(o => o.setName('image_upload').setDescription('Upload an image for the event banner.').setRequired(false))
+        // Other details will be collected via a Modal.
     )
     .addSubcommand(sc =>
       sc.setName('publish')
@@ -92,11 +93,22 @@ module.exports = {
     )
     .addSubcommand(sc =>
       sc.setName('edit')
-        .setDescription('Edit an existing event.')
+        .setDescription('Edit an existing event (basic info, location, custom fields).')
         .addIntegerOption(o => o.setName('event_id').setDescription('The ID of the event to edit.').setRequired(true))
-        // Editing will also likely use a Modal or select menus
+        // This will now primarily be a gateway to further actions via buttons/modals
+    )
+    .addSubcommand(subcommand =>
+      subcommand.setName('edit_image')
+        .setDescription('[Admin] Change or set the main image for an event.')
+        .addIntegerOption(o => o.setName('event_id').setDescription('The ID of the event to update.').setRequired(true))
+        .addAttachmentOption(o => o.setName('image_upload').setDescription('Upload a new image for the event.').setRequired(false))
+        .addStringOption(o => o.setName('image_url').setDescription('Set a new image URL (or "none" to clear).').setRequired(false))
+    )
+    .addSubcommand(sc =>
+      sc.setName('rsvps')
+        .setDescription('[Admin] View RSVPs for an event.')
+        .addIntegerOption(o => o.setName('event_id').setDescription('The ID of the event.').setRequired(true))
     ),
-    // Subcommands for RSVP, Templates, Custom Fields, etc. will be added in later phases.
 
   async execute(interaction, linkStore, envConfig) { // Added linkStore and envConfig
     /* Global try/catch to avoid crashes */
@@ -112,7 +124,7 @@ module.exports = {
       log('Subcmd:', sub);
 
       // Permission check for admin-only commands
-      const adminCommands = ['create', 'publish', 'delete', 'edit']; // Add other admin subcommands here
+      const adminCommands = ['create', 'publish', 'delete', 'edit', 'rsvps']; // Added 'rsvps'
       if (adminCommands.includes(sub) && !isEventAdmin(interaction, envConfig.ADMIN_ROLES)) {
         const noPermsEmbed = new EmbedBuilder().setColor(0xE53935).setTitle('🚫 Permission Denied').setDescription('You do not have the required permissions to use this subcommand.');
         return interaction.editReply({ embeds: [noPermsEmbed] });
@@ -144,6 +156,36 @@ module.exports = {
 
       /* ─────────── CREATE ─────────── */
       if (sub === 'create') {
+        const attachment = interaction.options.getAttachment('image_upload');
+        let uploadedImageUrl = null;
+
+        if (attachment) {
+          if (!envConfig.EVENT_ASSET_CHANNEL_ID) {
+            return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Configuration Error').setDescription('Event asset channel is not configured. Cannot process image uploads.')], ephemeral: true });
+          }
+          if (!attachment.contentType || !attachment.contentType.startsWith('image/')) {
+            return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Invalid File Type').setDescription('Please upload a valid image file (PNG, JPG, GIF).')], ephemeral: true });
+          }
+
+          try {
+            const assetChannel = await interaction.client.channels.fetch(envConfig.EVENT_ASSET_CHANNEL_ID);
+            if (!assetChannel || !assetChannel.isTextBased()) {
+              throw new Error('Asset channel not found or not text-based.');
+            }
+            const sentMessage = await assetChannel.send({ files: [attachment] });
+            uploadedImageUrl = sentMessage.attachments.first()?.url;
+            if (!uploadedImageUrl) {
+              throw new Error('Failed to get URL from uploaded attachment.');
+            }
+            // Store for modal handler
+            interaction.client.pendingEventCreations.set(interaction.user.id, { attachmentUrl: uploadedImageUrl });
+            log(`Uploaded event image for ${interaction.user.id}: ${uploadedImageUrl}`);
+          } catch (uploadError) {
+            console.error('Failed to upload event image to asset channel:', uploadError);
+            return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Image Upload Failed').setDescription('There was an error processing your image upload. Please try providing a URL instead or try again later.')], ephemeral: true });
+          }
+        }
+
         // Modal for event creation
         const modal = new ModalBuilder().setCustomId('eventCreateModal').setTitle('Create New Event (Draft)');
 
@@ -174,7 +216,10 @@ module.exports = {
           const notFoundEmbed = new EmbedBuilder().setColor(0xFFC107).setTitle('🔎 Event Not Found').setDescription(`Event with ID #${eventId} could not be found.`);
           return interaction.editReply({ embeds: [notFoundEmbed] });
         }
-        const viewEmbed = buildEventEmbed(event, envConfig); // Pass full envConfig if needed by buildEventEmbed
+        // Fetch and attach custom fields
+        event.custom_fields = await linkStore.getEventCustomFields(eventId);
+
+        const viewEmbed = buildEventEmbed(event, envConfig);
         return interaction.editReply({ embeds: [viewEmbed], ephemeral: event.status === 'draft' }); // Ephemeral if draft
       }
 
@@ -192,13 +237,49 @@ module.exports = {
         }
 
         const now = Math.floor(Date.now() / 1000);
-        await linkStore.updateEventStatus(eventId, 'published', now);
 
-        const announcementEmbed = buildEventEmbed(event, envConfig); // Use the helper
-        const announcementMsg = await targetChannel.send({ embeds: [announcementEmbed] /* TODO: Add RSVP buttons here in Phase 2 */ });
+        // Fetch event data again to ensure it's fresh before building embed, or merge if updateEventStatus doesn't return it
+        let eventToPublish = await linkStore.getEventById(eventId); // Get latest data including any prior edits
+        if (!eventToPublish) { /* Should not happen if previous checks passed */ }
+
+        await linkStore.updateEventStatus(eventId, 'published', now);
+        eventToPublish.status = 'published'; // Reflect status change for embed
+        eventToPublish.updated_at = now;
+
+        // Fetch and attach custom fields for the announcement
+        eventToPublish.custom_fields = await linkStore.getEventCustomFields(eventId);
+
+        const announcementEmbed = buildEventEmbed(eventToPublish, envConfig);
+
+        const rsvpRow = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`rsvp-going-${eventId}`)
+                    .setLabel('Going')
+                    .setStyle(3) // Green - Success
+                    .setEmoji('✅'),
+                new ButtonBuilder()
+                    .setCustomId(`rsvp-interested-${eventId}`)
+                    .setLabel('Interested')
+                    .setStyle(1) // Blue - Primary
+                    .setEmoji('🤔'),
+                new ButtonBuilder()
+                    .setCustomId(`rsvp-cantgo-${eventId}`)
+                    .setLabel('Can\'t Go')
+                    .setStyle(4) // Red - Danger
+                    .setEmoji('❌')
+            );
+
+        const announcementMsg = await targetChannel.send({ embeds: [announcementEmbed], components: [rsvpRow] });
 
         // Store message ID for future updates (e.g., RSVP counts)
-        await linkStore.updateEvent(eventId, { announcement_message_id: announcementMsg.id, announcement_channel_id: targetChannel.id, status: 'published', updated_at: now });
+        // Also ensure the event object used for the embed has the latest status
+        await linkStore.updateEvent(eventId, {
+            announcement_message_id: announcementMsg.id,
+            announcement_channel_id: targetChannel.id,
+            status: 'published', // Ensure status is set here if updateEventStatus doesn't return the object
+            updated_at: now
+        });
 
         const successEmbed = new EmbedBuilder().setColor(0x4CAF50).setTitle('📢 Event Published').setDescription(`Event **${event.title}** (ID #${eventId}) has been successfully published to ${targetChannel}.`);
         return interaction.editReply({ embeds: [successEmbed] });
@@ -230,16 +311,108 @@ module.exports = {
          if (!eventToEdit) {
              return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Error').setDescription(`Event with ID #${eventId} not found.`)] });
          }
-         // TODO: Implement Modal for editing, similar to create.
-         // For this phase, we might only allow editing title/description via direct options if added,
-         // or simply state this part is more fully developed with modals later.
-        const editPlaceholderEmbed = new EmbedBuilder()
-            .setColor(0x00BCD4)
-            .setTitle('✏️ Edit Event (Basic)')
-            .setDescription(`Editing for event ID #${eventId}. Full editing capabilities using modals will be available in a future update. For now, ensure you use specific edit commands if available or re-create the event for major changes.`);
-        return interaction.editReply({ embeds: [editPlaceholderEmbed] });
+
+        // For now, the main /events edit command will show current details and offer buttons to edit parts.
+        // One of those buttons will be "Manage Custom Fields".
+        const currentEventEmbed = buildEventEmbed(eventToEdit, envConfig);
+        const editActionRow = new ActionRowBuilder()
+            .addComponents(
+                // Button to trigger a modal for basic info (title, desc, date, time) - Future Step
+                // new ButtonBuilder().setCustomId(`edit-event-basic-${eventId}`).setLabel('Edit Basic Info').setStyle(1),
+                new ButtonBuilder().setCustomId(`manage-custom-fields-${eventId}`).setLabel('Manage Custom Fields').setStyle(2), // Secondary
+                new ButtonBuilder().setCustomId(`edit-event-image-${eventId}`).setLabel('Change Image').setStyle(2) // Secondary (links to /events edit_image or similar modal)
+            );
+
+        currentEventEmbed.setTitle(`✏️ Editing Event: ${eventToEdit.title} (ID #${eventId})`);
+        currentEventEmbed.setDescription(`${eventToEdit.description}\n\nSelect an action below to modify the event.`);
+
+        return interaction.editReply({ embeds: [currentEventEmbed], components: [editActionRow], ephemeral: true });
       }
 
+      /* ─────────── EDIT IMAGE ─────────── */
+      if (sub === 'edit_image') {
+        const eventId = interaction.options.getInteger('event_id');
+        const attachment = interaction.options.getAttachment('image_upload');
+        let imageUrl = interaction.options.getString('image_url'); // Can be null or "none"
+
+        if (!attachment && !imageUrl) {
+            return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Missing Input').setDescription('Please provide either an image upload or an image URL.')], ephemeral: true });
+        }
+
+        const eventToEdit = await linkStore.getEventById(eventId);
+        if (!eventToEdit) {
+            return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Error').setDescription(`Event with ID #${eventId} not found.`)] });
+        }
+
+        let finalImageUrl = eventToEdit.image_main_url; // Default to existing
+
+        if (attachment) {
+            if (!envConfig.EVENT_ASSET_CHANNEL_ID) {
+              return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Configuration Error').setDescription('Event asset channel is not configured for uploads.')], ephemeral: true });
+            }
+            if (!attachment.contentType || !attachment.contentType.startsWith('image/')) {
+              return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Invalid File Type').setDescription('Please upload a valid image file.')], ephemeral: true });
+            }
+            try {
+              const assetChannel = await interaction.client.channels.fetch(envConfig.EVENT_ASSET_CHANNEL_ID);
+              const sentMessage = await assetChannel.send({ files: [attachment] });
+              finalImageUrl = sentMessage.attachments.first()?.url;
+              if (!finalImageUrl) throw new Error('Failed to get URL from uploaded attachment.');
+            } catch (uploadError) {
+              console.error('Failed to upload event image for edit:', uploadError);
+              return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Image Upload Failed').setDescription('Error processing image upload.')], ephemeral: true });
+            }
+        } else if (imageUrl) {
+            if (imageUrl.toLowerCase() === 'none' || imageUrl.toLowerCase() === 'clear') {
+                finalImageUrl = null;
+            } else if (!imageUrl.startsWith('http://') && !imageUrl.startsWith('https://')) {
+                 return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Invalid URL').setDescription('Please provide a valid HTTP/HTTPS URL or "none" to clear the image.')], ephemeral: true });
+            } else {
+                finalImageUrl = imageUrl;
+            }
+        }
+
+        await linkStore.updateEvent(eventId, { image_main_url: finalImageUrl });
+        const successEmbed = new EmbedBuilder()
+            .setColor(0x4CAF50)
+            .setTitle('🖼️ Event Image Updated')
+            .setDescription(`The main image for event **${eventToEdit.title}** (ID #${eventId}) has been updated.`)
+            .setImage(finalImageUrl) // Show the new image if one is set
+            .setTimestamp();
+        return interaction.editReply({ embeds: [successEmbed] });
+      }
+
+      /* ─────────── RSVPS (Admin View) ─────────── */
+      if (sub === 'rsvps') {
+        const eventId = interaction.options.getInteger('event_id');
+        const event = await linkStore.getEventById(eventId);
+
+        if (!event) {
+          return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('🔎 Event Not Found').setDescription(`Event with ID #${eventId} could not be found.`)] });
+        }
+
+        const rsvpsGoing = await linkStore.getRsvpsForEvent(eventId, 'going');
+        const rsvpsInterested = await linkStore.getRsvpsForEvent(eventId, 'interested');
+        // const rsvpsWaitlisted = await linkStore.getRsvpsForEvent(eventId, 'waitlisted'); // For future
+
+        const rsvpEmbed = new EmbedBuilder()
+            .setColor(0x00BCD4) // INFO_COLOR
+            .setTitle(`🎟️ RSVPs for Event: ${event.title} (ID #${eventId})`)
+            .setTimestamp();
+
+        const formatRsvpList = (list) => {
+            if (!list || list.length === 0) return 'None';
+            return list.map(r => `<@${r.user_discord_id}> (<t:${r.rsvp_at}:R>)`).join('\n');
+        };
+
+        rsvpEmbed.addFields(
+            { name: `✅ Going (${rsvpsGoing.length}/${event.capacity > 0 ? event.capacity : '∞'})`, value: formatRsvpList(rsvpsGoing).substring(0, 1024), inline: false },
+            { name: `🤔 Interested (${rsvpsInterested.length})`, value: formatRsvpList(rsvpsInterested).substring(0, 1024), inline: false }
+            // { name: `⏳ Waitlisted (${rsvpsWaitlisted.length})`, value: formatRsvpList(rsvpsWaitlisted).substring(0,1024), inline: false }
+        );
+
+        return interaction.editReply({ embeds: [rsvpEmbed] });
+      }
 
     } catch (err) {
       console.error('💥 Error in /events command:', err);
@@ -280,10 +453,13 @@ function buildEventEmbed(event, envConfig) { // envConfig might be useful for gl
     embed.addFields({ name: 'Capacity', value: 'Unlimited', inline: true });
   }
 
-  // Placeholder for custom fields display - Phase 2
-  // if (event.custom_fields && event.custom_fields.length > 0) {
-  //   event.custom_fields.forEach(cf => embed.addFields({ name: cf.field_name, value: cf.field_value, inline: true}));
-  // }
+  // Custom Fields display
+  if (event.custom_fields && event.custom_fields.length > 0) {
+    embed.addFields({ name: '\u200B', value: '**Additional Details:**' }); // Separator
+    event.custom_fields.forEach(cf => {
+      embed.addFields({ name: cf.field_name, value: cf.field_value, inline: true });
+    });
+  }
 
   embed.setFooter({ text: `Created by: ${event.creator_discord_id} • Last updated: <t:${event.updated_at}:R>` })
        .setTimestamp(event.created_at * 1000); // Timestamp of original creation
