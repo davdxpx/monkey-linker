@@ -14,14 +14,25 @@ module.exports = {
     await interaction.deferReply({ ephemeral: true });
 
     // 1️⃣  Get verified row
-    const row = await new Promise(res =>
-      db.get('SELECT * FROM links WHERE discord=? AND verified=1', [interaction.user.id], (_, r) => res(r))
-    );
-    if (!row) return interaction.editReply('🚫 You are not linked yet. Use `/connect`.');
+    const row = await db.get(interaction.user.id); // Use linkStore.get()
+
+    // Check if linked and verified
+    if (!row || !row.verified) {
+      const notLinkedEmbed = new EmbedBuilder()
+        .setColor(0xFFC107) // WARN_COLOR
+        .setTitle('🚫 Not Linked or Verified')
+        .setDescription('You must link your Roblox account and verify it using `/connect` before checking your progress.');
+      return interaction.editReply({ embeds: [notLinkedEmbed] });
+    }
 
     // 2️⃣  Guard Open‑Cloud
-    if (!cfg.UNIVERSE_ID || !cfg.OC_KEY)
-      return interaction.editReply('⚠️ Progress lookup not configured on this bot.');
+    if (!cfg.UNIVERSE_ID || !cfg.OC_KEY) {
+      const notConfiguredEmbed = new EmbedBuilder()
+        .setColor(0xFFC107) // WARN_COLOR
+        .setTitle('⚠️ Feature Not Configured')
+        .setDescription('Progress lookup via OpenCloud is not configured for this bot. Please contact an administrator.');
+      return interaction.editReply({ embeds: [notConfiguredEmbed] });
+    }
 
     try {
       // 3️⃣  Fetch DataStore blob
@@ -69,7 +80,11 @@ module.exports = {
       interaction.editReply({ embeds: [embed] });
     } catch (err) {
       console.error(err);
-      interaction.editReply('❌ Failed to fetch progress. Try again later.');
+      const fetchErrorEmbed = new EmbedBuilder()
+        .setColor(0xE53935) // ERROR_COLOR
+        .setTitle('❌ Failed to Fetch Progress')
+        .setDescription('An error occurred while trying to fetch your progress from Roblox. Please try again later.');
+      interaction.editReply({ embeds: [fetchErrorEmbed] });
     }
   }
 };

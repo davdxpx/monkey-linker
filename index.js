@@ -270,7 +270,11 @@ client.on('interactionCreate', async interaction => {
     const respond = interaction.replied || interaction.deferred
       ? interaction.followUp.bind(interaction)
       : interaction.reply.bind(interaction);
-    respond({ content: '⚠️ Internal error', ephemeral: true }).catch(() => {});
+    const errorEmbed = new EmbedBuilder()
+      .setColor(0xE53935) // ERROR_COLOR
+      .setTitle('⚠️ Internal Error')
+      .setDescription('An unexpected error occurred while processing this command. Please try again later. If the issue persists, contact an administrator.');
+    respond({ embeds: [errorEmbed], ephemeral: true }).catch(() => {});
   }
 });
 

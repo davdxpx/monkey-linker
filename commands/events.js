@@ -124,10 +124,11 @@ module.exports = {
     /* Global try/catch to avoid crashes */
     try {
       if (!interaction.inGuild()) {
-        return interaction.reply({
-          content: '⚠️ This command is only available in servers.',
-          ephemeral: true,
-        });
+        const guildOnlyEmbed = new EmbedBuilder()
+          .setColor(0xFFC107) // WARN_COLOR
+          .setTitle('⚠️ Guild Only Command')
+          .setDescription('This command can only be used inside a server.');
+        return interaction.reply({ embeds: [guildOnlyEmbed], ephemeral: true });
       }
 
       const sub = interaction.options.getSubcommand();
@@ -159,11 +160,12 @@ module.exports = {
 
       /* ────────── Permission Check for mutating ops ────────── */
       const member = await interaction.guild.members.fetch(interaction.user.id);
-      if (!isEventAdmin(member)) {
-        return interaction.reply({
-          content: '🚫 You need the **Event‑Admin** role to do that.',
-          ephemeral: true,
-        });
+      if (['create', 'delete', 'edit'].includes(sub) && !isEventAdmin(member)) { // Check only for mutating subcommands
+        const noPermsEmbed = new EmbedBuilder()
+          .setColor(0xE53935) // ERROR_COLOR
+          .setTitle('🚫 Permission Denied')
+          .setDescription('You do not have the required "Event-Admin" role or administrator permissions to use this command.');
+        return interaction.reply({ embeds: [noPermsEmbed], ephemeral: true });
       }
 
       /* ─────────── CREATE ─────────── */
@@ -196,25 +198,31 @@ module.exports = {
           });
         }
 
-        return interaction.reply({
-          content: `🎉 Event **${newEv.title}** added (#${events.length - 1}).`,
-          ephemeral: true,
-        });
+        const createdEmbed = new EmbedBuilder()
+          .setColor(0x4CAF50) // SUCCESS_COLOR
+          .setTitle('🎉 Event Created')
+          .setDescription(`Event **${newEv.title}** has been successfully added with ID #${events.length - 1}.`);
+        return interaction.reply({ embeds: [createdEmbed], ephemeral: true });
       }
 
       /* ─────────── DELETE ─────────── */
       if (sub === 'delete') {
         const id = interaction.options.getInteger('id');
         if (id < 0 || id >= events.length) {
-          return interaction.reply({ content: '❌ Invalid ID.', ephemeral: true });
+          const invalidIdEmbed = new EmbedBuilder()
+            .setColor(0xE53935) // ERROR_COLOR
+            .setTitle('❌ Invalid ID')
+            .setDescription('The event ID you provided is not valid. Please use `/events list` to see available IDs.');
+          return interaction.reply({ embeds: [invalidIdEmbed], ephemeral: true });
         }
         const [removed] = events.splice(id, 1);
         saveEvents(events);
         log('Deleted event', removed);
-        return interaction.reply({
-          content: `🗑️ Event **${removed.title}** deleted.`,
-          ephemeral: true,
-        });
+        const deletedEmbed = new EmbedBuilder()
+          .setColor(0x4CAF50) // SUCCESS_COLOR
+          .setTitle('🗑️ Event Deleted')
+          .setDescription(`Event **${removed.title}** (ID #${id}) has been successfully deleted.`);
+        return interaction.reply({ embeds: [deletedEmbed], ephemeral: true });
       }
 
       /* ─────────── EDIT ─────────── */
@@ -224,7 +232,11 @@ module.exports = {
         const value = interaction.options.getString('value');
 
         if (id < 0 || id >= events.length) {
-          return interaction.reply({ content: '❌ Invalid ID.', ephemeral: true });
+          const invalidIdEmbed = new EmbedBuilder()
+            .setColor(0xE53935) // ERROR_COLOR
+            .setTitle('❌ Invalid ID')
+            .setDescription('The event ID you provided is not valid. Please use `/events list` to see available IDs.');
+          return interaction.reply({ embeds: [invalidIdEmbed], ephemeral: true });
         }
         const target = events[id];
 
@@ -238,19 +250,23 @@ module.exports = {
           'reward',
           'capacity',
         ];
-        if (!editable.includes(field))
-          return interaction.reply({
-            content: `❌ Editable fields: ${editable.join(', ')}`,
-            ephemeral: true,
-          });
+        if (!editable.includes(field)) {
+          const invalidFieldEmbed = new EmbedBuilder()
+            .setColor(0xE53935) // ERROR_COLOR
+            .setTitle('❌ Invalid Field')
+            .setDescription(`The field \`${field}\` is not editable. Editable fields are: ${editable.join(', ')}.`);
+          return interaction.reply({ embeds: [invalidFieldEmbed], ephemeral: true });
+        }
 
         if (field === 'capacity') {
           const capNum = parseInt(value, 10);
-          if (Number.isNaN(capNum) || capNum < 0)
-            return interaction.reply({
-              content: '❌ Capacity must be a positive integer.',
-              ephemeral: true,
-            });
+          if (Number.isNaN(capNum) || capNum < 0) {
+            const invalidCapacityEmbed = new EmbedBuilder()
+              .setColor(0xE53935) // ERROR_COLOR
+              .setTitle('❌ Invalid Capacity')
+              .setDescription('Capacity must be a positive integer (or 0 for unlimited).');
+            return interaction.reply({ embeds: [invalidCapacityEmbed], ephemeral: true });
+          }
           target.capacity = capNum;
         } else {
           target[field] = value;
@@ -258,31 +274,41 @@ module.exports = {
 
         saveEvents(events);
         log('Edited event', id, field, '→', value);
-        return interaction.reply({
-          content: `✏️ Event **${target.title}** updated (${field}).`,
-          ephemeral: true,
-        });
+        const editedEmbed = new EmbedBuilder()
+          .setColor(0x4CAF50) // SUCCESS_COLOR
+          .setTitle('✏️ Event Updated')
+          .setDescription(`Event **${target.title}** (ID #${id}) has been updated (field: ${field}).`);
+        return interaction.reply({ embeds: [editedEmbed], ephemeral: true });
       }
 
       /* ─────────── ANNOUNCE ─────────── */
       if (sub === 'announce') {
         const id = interaction.options.getInteger('id');
         if (id < 0 || id >= events.length) {
-          return interaction.reply({ content: '❌ Invalid ID.', ephemeral: true });
+          const invalidIdEmbed = new EmbedBuilder()
+            .setColor(0xE53935) // ERROR_COLOR
+            .setTitle('❌ Invalid ID')
+            .setDescription('The event ID you provided is not valid. Please use `/events list` to see available IDs.');
+          return interaction.reply({ embeds: [invalidIdEmbed], ephemeral: true });
         }
         const ev = events[id];
-        const embed = buildEventEmbed(ev, id);
+        const embed = buildEventEmbed(ev, id); // Uses existing helper
         await interaction.channel.send({ embeds: [embed] });
         log('Announced event', id);
-        return interaction.reply({ content: '📢 Event announced!', ephemeral: true });
+        const announcedEmbed = new EmbedBuilder()
+          .setColor(0x00BCD4) // INFO_COLOR
+          .setTitle('📢 Event Announced')
+          .setDescription(`Event **${ev.title}** (ID #${id}) has been announced in this channel.`);
+        return interaction.reply({ embeds: [announcedEmbed], ephemeral: true });
       }
     } catch (err) {
       console.error('💥 Error in /events command:', err);
       try {
-        return interaction.reply({
-          content: '⚠️ Internal error occurred while processing the command.',
-          ephemeral: true,
-        });
+        const errorEmbed = new EmbedBuilder()
+          .setColor(0xE53935) // ERROR_COLOR
+          .setTitle('⚠️ Internal Error')
+          .setDescription('An unexpected error occurred while processing the command. Please try again later or contact an administrator.');
+        return interaction.reply({ embeds: [errorEmbed], ephemeral: true });
       } catch {
         /* ignore secondary failures */
       }
