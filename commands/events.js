@@ -133,22 +133,18 @@ module.exports = {
     ),
 
   async execute(interaction, linkStore, envConfig) { // Added linkStore and envConfig
+    console.log(`[EVENTS_COMMAND_HANDLER] Executing /events for interaction ID: ${interaction.id} at ${new Date().toISOString()}`);
     /* Global try/catch to avoid crashes */
-    let deferredSuccessfully = false;
     try {
       try {
+        console.log(`[EVENTS_COMMAND_HANDLER] Attempting to defer interaction ID: ${interaction.id} at ${new Date().toISOString()}`);
         await interaction.deferReply({ ephemeral: true }); // Defer all replies for consistency
-        deferredSuccessfully = true;
       } catch (deferError) {
-        console.error('💥 Critical: deferReply failed in /events command:', deferError);
-        // Attempt a direct reply if defer failed. This might also fail if the interaction is truly unknown.
+        console.error(`💥 Critical: deferReply failed in /events command for interaction ID: ${interaction.id}:`, deferError);
         try {
           await interaction.reply({ content: "Sorry, I couldn't start processing your command due to an issue acknowledging it with Discord. Please try again in a moment.", ephemeral: true });
         } catch (replyError) {
-          console.error('💥 Critical: Fallback reply also failed in /events command:', replyError);
-          // If both defer and reply fail, there's not much more we can do with this interaction.
-          // The error will propagate to the outer catch block in index.js if necessary,
-          // but we won't proceed with command logic here.
+          console.error(`💥 Critical: Fallback reply also failed in /events command for interaction ID: ${interaction.id}:`, replyError);
         }
         return; // Stop execution if deferReply failed
       }
