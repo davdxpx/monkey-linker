@@ -134,8 +134,24 @@ module.exports = {
 
   async execute(interaction, linkStore, envConfig) { // Added linkStore and envConfig
     /* Global try/catch to avoid crashes */
+    let deferredSuccessfully = false;
     try {
-      await interaction.deferReply({ ephemeral: true }); // Defer all replies for consistency
+      try {
+        await interaction.deferReply({ ephemeral: true }); // Defer all replies for consistency
+        deferredSuccessfully = true;
+      } catch (deferError) {
+        console.error('💥 Critical: deferReply failed in /events command:', deferError);
+        // Attempt a direct reply if defer failed. This might also fail if the interaction is truly unknown.
+        try {
+          await interaction.reply({ content: "Sorry, I couldn't start processing your command due to an issue acknowledging it with Discord. Please try again in a moment.", ephemeral: true });
+        } catch (replyError) {
+          console.error('💥 Critical: Fallback reply also failed in /events command:', replyError);
+          // If both defer and reply fail, there's not much more we can do with this interaction.
+          // The error will propagate to the outer catch block in index.js if necessary,
+          // but we won't proceed with command logic here.
+        }
+        return; // Stop execution if deferReply failed
+      }
 
       if (!interaction.inGuild()) {
         const guildOnlyEmbed = new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Guild Only Command').setDescription('This command can only be used inside a server.');
