@@ -588,9 +588,14 @@ module.exports = {
           .setColor(0xE53935) // ERROR_COLOR
           .setTitle('⚠️ Internal Error')
           .setDescription('An unexpected error occurred while processing the command. Please try again later or contact an administrator.');
-        return interaction.reply({ embeds: [errorEmbed], ephemeral: true });
-      } catch {
-        /* ignore secondary failures */
+        if (interaction.deferred || interaction.replied) {
+          return interaction.followUp({ embeds: [errorEmbed], ephemeral: true });
+        } else {
+          return interaction.reply({ embeds: [errorEmbed], ephemeral: true });
+        }
+      } catch (secondaryError) {
+        console.error('💥 Error in /events command secondary error handler:', secondaryError);
+        /* ignore secondary failures, but log them */
       }
     }
   },
