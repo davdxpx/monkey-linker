@@ -69,6 +69,7 @@ const {
   StringSelectMenuBuilder, // Added
   ModalBuilder,          // Added (already used but good to ensure it's explicitly here)
   TextInputBuilder,      // Added (already used but good to ensure it's explicitly here)
+  MessageFlags,          // Added
 } = require('discord.js');
 const { migrateEventsJsonToDb, EVENTS_JSON_PATH } = require('./utils/migrateEvents.js');
 
@@ -795,7 +796,7 @@ client.on('interactionCreate', async interaction => {
       components.push(manageButtonsRow);
 
 
-      await interaction.reply({ embeds: [successEmbed], components: components, ephemeral: true });
+      await interaction.reply({ embeds: [successEmbed], components: components, flags: MessageFlags.Ephemeral });
 
       if (pendingData) {
         client.pendingEventCreations.delete(interaction.user.id); // Clean up
@@ -805,9 +806,9 @@ client.on('interactionCreate', async interaction => {
       console.error('Error processing eventCreateModal:', modalError);
       // Ensure reply if not already done
       if (!interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: 'There was an error creating your event draft. Please try again.', ephemeral: true }).catch(()=>{});
+        await interaction.reply({ content: 'There was an error creating your event draft. Please try again.', flags: MessageFlags.Ephemeral }).catch(()=>{});
       } else {
-        await interaction.followUp({ content: 'There was an error creating your event draft. Please try again.', ephemeral: true }).catch(()=>{});
+        await interaction.followUp({ content: 'There was an error creating your event draft. Please try again.', flags: MessageFlags.Ephemeral }).catch(()=>{});
       }
     }
    } else if (interaction.customId.startsWith('customFieldAddModal-')) {
@@ -819,7 +820,7 @@ client.on('interactionCreate', async interaction => {
         const displayOrder = displayOrderStr ? parseInt(displayOrderStr, 10) : 0;
 
         if (!fieldName || !fieldValue) {
-          return interaction.reply({ content: 'Field Name and Field Value are required.', ephemeral: true });
+          return interaction.reply({ content: 'Field Name and Field Value are required.', flags: MessageFlags.Ephemeral });
         }
 
         await linkStore.addEventCustomField(eventId, fieldName, fieldValue, displayOrder || 0);
@@ -830,10 +831,10 @@ client.on('interactionCreate', async interaction => {
             new ButtonBuilder().setCustomId(`custom-field-finish-${eventId}`).setLabel('Finish Adding Fields').setStyle(2) // Secondary
           );
 
-        return interaction.reply({ content: `Custom field "**${fieldName}**" added. Add another or finish.`, components: [row], ephemeral: true });
+        return interaction.reply({ content: `Custom field "**${fieldName}**" added. Add another or finish.`, components: [row], flags: MessageFlags.Ephemeral });
       } catch (customModalError) {
         console.error('Error processing customFieldAddModal:', customModalError);
-        return interaction.reply({ content: 'Error adding custom field.', ephemeral: true });
+        return interaction.reply({ content: 'Error adding custom field.', flags: MessageFlags.Ephemeral });
       }
     } else if (interaction.customId.startsWith('eventRewardAddModal-')) {
       try {
@@ -845,7 +846,7 @@ client.on('interactionCreate', async interaction => {
         const displayOrder = displayOrderStr ? parseInt(displayOrderStr, 10) : 0;
 
         if (!name) {
-          return interaction.reply({ content: 'Reward Name is required.', ephemeral: true });
+          return interaction.reply({ content: 'Reward Name is required.', flags: MessageFlags.Ephemeral });
         }
 
         await linkStore.addEventReward(eventId, name, description, imageUrl, displayOrder || 0);
@@ -857,10 +858,10 @@ client.on('interactionCreate', async interaction => {
             new ButtonBuilder().setCustomId(`reward-finish-${eventId}`).setLabel('Finish Adding Rewards').setStyle(2)
           );
 
-        return interaction.reply({ content: `Reward "**${name}**" added. Add another or finish.`, components: [row], ephemeral: true });
+        return interaction.reply({ content: `Reward "**${name}**" added. Add another or finish.`, components: [row], flags: MessageFlags.Ephemeral });
       } catch (rewardModalError) {
         console.error('Error processing eventRewardAddModal:', rewardModalError);
-        return interaction.reply({ content: 'Error adding reward.', ephemeral: true });
+        return interaction.reply({ content: 'Error adding reward.', flags: MessageFlags.Ephemeral });
       }
     }
   } else if (interaction.isButton()) {
@@ -873,12 +874,13 @@ client.on('interactionCreate', async interaction => {
       const eventId = parseInt(eventIdStr, 10);
       const rsvpStatus = action; // 'going', 'interested', 'cantgo'
       try {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const userId = interaction.user.id;
         const event = await linkStore.getEventById(eventId);
 
         if (!event || event.status !== 'published') {
-          return interaction.editReply({ content: 'This event is not available or no longer active for RSVPs.', ephemeral: true });
+          // editReply will be ephemeral due to deferReply
+          return interaction.editReply({ content: 'This event is not available or no longer active for RSVPs.' });
         }
 
         let newRsvpStatus = type;
@@ -895,7 +897,7 @@ client.on('interactionCreate', async interaction => {
             const existingRsvp = await linkStore.getRsvp(eventId, userId);
             if (!existingRsvp || existingRsvp.rsvp_status !== 'going') {
                  // For now, just inform it's full. Waitlist is a future enhancement for this step.
-                return interaction.editReply({ content: `Sorry, event **${event.title}** has reached its capacity for 'Going' RSVPs. You can still mark yourself as 'Interested'.`, ephemeral: true });
+                return interaction.editReply({ content: `Sorry, event **${event.title}** has reached its capacity for 'Going' RSVPs. You can still mark yourself as 'Interested'.` });
             }
           }
 
@@ -919,11 +921,11 @@ client.on('interactionCreate', async interaction => {
             }
         }
 
-        return interaction.editReply({ content: replyMessage, ephemeral: true });
+        return interaction.editReply({ content: replyMessage });
 
       } catch (rsvpError) {
         console.error(`Error processing RSVP button for event ${eventId}:`, rsvpError);
-        return interaction.editReply({ content: 'There was an error processing your RSVP. Please try again.', ephemeral: true }).catch(()=>{});
+        return interaction.editReply({ content: 'There was an error processing your RSVP. Please try again.' }).catch(()=>{});
       }
     } else if (prefix === 'manage' && action === 'custom' && customIdParts[2] === 'fields' && customIdParts[3]) {
         // manage-custom-fields-<eventId>
@@ -941,7 +943,7 @@ client.on('interactionCreate', async interaction => {
     } else if (prefix === 'custom' && action === 'field' && customIdParts[2] === 'finish' && customIdParts[3]) {
         // custom-field-finish-<eventId>
         const eventIdCf = parseInt(customIdParts[3], 10); // Renamed to avoid conflict
-        await interaction.update({ content: `Finished adding custom fields for Event #${eventIdCf}. You can publish or further edit the event.`, components: [], ephemeral: true });
+        await interaction.update({ content: `Finished adding custom fields for Event #${eventIdCf}. You can publish or further edit the event.`, components: [] });
     } else if (prefix === 'edit' && action === 'location' && eventIdStr) {
         // edit-location-<eventId>
         const eventId = parseInt(eventIdStr, 10);
@@ -960,7 +962,7 @@ client.on('interactionCreate', async interaction => {
         // interaction.update is for the component's message. If the original /events edit reply had components, this would update it.
         // If it was just an embed, we might need to send a new message or ensure the original interaction can be updated.
         // For simplicity with ephemeral, we can use editReply on the button's interaction.
-        await interaction.update({ content: `Changing location for Event #${eventId}. Please select the new island.`, embeds: [], components: [row], ephemeral: true });
+        await interaction.update({ content: `Changing location for Event #${eventId}. Please select the new island.`, embeds: [], components: [row] });
 
     } else if (prefix === 'manage' && action === 'event' && customIdParts[2] === 'rewards' && customIdParts[3]) {
         // manage-event-rewards-<eventId>
@@ -984,7 +986,7 @@ client.on('interactionCreate', async interaction => {
     } else if (prefix === 'reward' && action === 'finish' && customIdParts[2]) {
         // reward-finish-<eventId>
         const eventId = parseInt(customIdParts[2], 10);
-        await interaction.update({ content: `Finished adding rewards for Event #${eventId}.`, components: [], ephemeral: true });
+        await interaction.update({ content: `Finished adding rewards for Event #${eventId}.`, components: [] });
     }
     // Other button interactions can be handled here
   } else if (interaction.isStringSelectMenu()) {
@@ -1022,11 +1024,11 @@ client.on('interactionCreate', async interaction => {
                 followupComponents.push(manageButtonsRow);
             }
             // Update the message that contained the island select menu
-            await interaction.update({ content: followupMessage, components: followupComponents, ephemeral: true });
+            await interaction.update({ content: followupMessage, components: followupComponents });
 
         } catch (islandSelectError) {
             console.error(`Error processing island select for event ${eventId}:`, islandSelectError);
-            await interaction.update({ content: 'There was an error setting the island. Please try again.', components: [], ephemeral: true }).catch(()=>{});
+            await interaction.update({ content: 'There was an error setting the island. Please try again.', components: [] }).catch(()=>{});
         }
     } else if (entity === 'area' && eventId) {
         try {
@@ -1044,10 +1046,10 @@ client.on('interactionCreate', async interaction => {
                     new ButtonBuilder().setCustomId(`manage-event-rewards-${eventId}`).setLabel('Manage Rewards').setStyle(2)
                 );
 
-            await interaction.update({ content: finalMessage, components: [manageButtonsRow], ephemeral: true });
+            await interaction.update({ content: finalMessage, components: [manageButtonsRow] });
         } catch (areaSelectError) {
             console.error(`Error processing area select for event ${eventId}:`, areaSelectError);
-            await interaction.update({ content: 'There was an error setting the area. Please try again.', components: [], ephemeral: true }).catch(()=>{});
+            await interaction.update({ content: 'There was an error setting the area. Please try again.', components: [] }).catch(()=>{});
         }
     }
   }
@@ -1061,7 +1063,7 @@ client.on('interactionCreate', async interaction => {
     // 3-Sek-Timeout umgehen → direkt antworten
     return interaction.reply({
       content: '⏳ Bot initialisiert noch … bitte gleich noch einmal `/connect` ausführen.',
-      ephemeral: true
+      flags: MessageFlags.Ephemeral
     }).catch(() => {});
   }
 
@@ -1072,7 +1074,7 @@ client.on('interactionCreate', async interaction => {
   const key = `${interaction.user.id}:${cmd.data.name}`;
   if (client.cooldowns.has(key) &&
       Date.now() - client.cooldowns.get(key) < (cmd.cooldown || 3000)) {
-    return interaction.reply({ content: '⏳ Cool-down … try again shortly.', ephemeral: true });
+    return interaction.reply({ content: '⏳ Cool-down … try again shortly.', flags: MessageFlags.Ephemeral });
   }
   client.cooldowns.set(key, Date.now());
 
@@ -1105,7 +1107,7 @@ client.on('interactionCreate', async interaction => {
       .setColor(0xE53935) // ERROR_COLOR
       .setTitle('⚠️ Internal Error')
       .setDescription('An unexpected error occurred while processing this command. Please try again later. If the issue persists, contact an administrator.');
-    respond({ embeds: [errorEmbed], ephemeral: true }).catch(() => {});
+    respond({ embeds: [errorEmbed], flags: MessageFlags.Ephemeral }).catch(() => {});
   }
 });
 

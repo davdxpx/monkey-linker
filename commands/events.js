@@ -15,7 +15,7 @@
 
 'use strict';
 
-const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits, ModalBuilder, TextInputBuilder, ActionRowBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder } = require('discord.js');
+const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits, ModalBuilder, TextInputBuilder, ActionRowBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder, MessageFlags } = require('discord.js');
 // Removed fs, path, DB_PATH, loadEvents, saveEvents
 
 const DEBUG = process.env.DEBUG_EVENTS === '1'; // opt‑in verbose logging
@@ -137,22 +137,25 @@ module.exports = {
     console.log(`[EVENTS_COMMAND_HANDLER] Executing /events for interaction ID: ${interaction.id} at ${new Date().toISOString()}`);
     /* Global try/catch to avoid crashes */
     try {
-      try {
-        console.log(`[EVENTS_COMMAND_HANDLER] Attempting to defer interaction ID: ${interaction.id} at ${new Date().toISOString()}`);
-        await interaction.deferReply({ ephemeral: true }); // Defer all replies for consistency
-      } catch (deferError) {
-        console.error(`💥 Critical: deferReply failed in /events command for interaction ID: ${interaction.id}:`, deferError);
-        try {
-          await interaction.reply({ content: "Sorry, I couldn't start processing your command due to an issue acknowledging it with Discord. Please try again in a moment.", ephemeral: true });
-        } catch (replyError) {
-          console.error(`💥 Critical: Fallback reply also failed in /events command for interaction ID: ${interaction.id}:`, replyError);
-        }
-        return; // Stop execution if deferReply failed
-      }
+      // Global deferReply removed. Each subcommand will handle its own deferral/reply.
 
       if (!interaction.inGuild()) {
+        // Since global defer is removed, this needs to reply directly.
         const guildOnlyEmbed = new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Guild Only Command').setDescription('This command can only be used inside a server.');
-        return interaction.editReply({ embeds: [guildOnlyEmbed] }); // Already deferred
+        try {
+            // Attempt to reply. If this is part of a flow that already replied/deferred, it might fail.
+            // However, this check is very early, so direct reply should be fine.
+            return await interaction.reply({ embeds: [guildOnlyEmbed], flags: MessageFlags.Ephemeral });
+        } catch (e) {
+            console.error("Failed to send guildOnlyEmbed reply:", e);
+            // If reply fails, maybe it was already handled? Log and potentially followUp.
+            try {
+                return await interaction.followUp({ embeds: [guildOnlyEmbed], flags: MessageFlags.Ephemeral });
+            } catch (fe) {
+                console.error("Failed to send guildOnlyEmbed followUp:", fe);
+                return; // Give up if followUp also fails
+            }
+        }
       }
 
       const sub = interaction.options.getSubcommand();
@@ -167,13 +170,18 @@ module.exports = {
       if ((adminSubcommands.includes(sub) && !group) || (group && adminGroups.includes(group))) {
           if (!isEventAdmin(interaction, envConfig)) { // Pass the whole envConfig
             const noPermsEmbed = new EmbedBuilder().setColor(0xE53935).setTitle('🚫 Permission Denied').setDescription('You do not have the required permissions to use this command/subcommand.');
-            return interaction.editReply({ embeds: [noPermsEmbed] }); // Assumes deferReply was successful
+            // Since global defer is removed, this needs to reply or defer then edit.
+            // Given this is a direct response to a command, a direct reply is appropriate.
+            return await interaction.reply({ embeds: [noPermsEmbed], flags: MessageFlags.Ephemeral });
           }
       }
 
 
       if (group === 'template') {
         // Handle template subcommands
+        // All template subcommands will need deferral if they don't immediately reply.
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
         if (sub === 'create') {
             const templateName = interaction.options.getString('name');
             const fromEventId = interaction.options.getInteger('from_event_id');
@@ -263,6 +271,7 @@ module.exports = {
 
       /* ─────────── LIST (Events) ─────────── */
       if (sub === 'list') {
+        await interaction.deferReply({ ephemeral: false }); // List is typically not ephemeral
         const publishedEvents = await linkStore.getPublishedEvents();
         const listEmbed = new EmbedBuilder().setTitle('📅 Upcoming Published Events').setColor(0x00bcd4).setTimestamp();
 
@@ -307,10 +316,10 @@ module.exports = {
 
         if (attachment) {
           if (!envConfig.EVENT_ASSET_CHANNEL_ID) {
-            return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Configuration Error').setDescription('Event asset channel is not configured. Cannot process image uploads.')], ephemeral: true });
+            return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Configuration Error').setDescription('Event asset channel is not configured. Cannot process image uploads.')], flags: MessageFlags.Ephemeral });
           }
           if (!attachment.contentType || !attachment.contentType.startsWith('image/')) {
-            return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Invalid File Type').setDescription('Please upload a valid image file (PNG, JPG, GIF).')], ephemeral: true });
+            return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Invalid File Type').setDescription('Please upload a valid image file (PNG, JPG, GIF).')], flags: MessageFlags.Ephemeral });
           }
 
           try {
@@ -328,7 +337,7 @@ module.exports = {
             log(`Uploaded event image for ${interaction.user.id}: ${uploadedImageUrl}`);
           } catch (uploadError) {
             console.error('Failed to upload event image to asset channel:', uploadError);
-            return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Image Upload Failed').setDescription('There was an error processing your image upload. Please try providing a URL instead or try again later.')], ephemeral: true });
+            return interaction.reply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Image Upload Failed').setDescription('There was an error processing your image upload. Please try providing a URL instead or try again later.')], flags: MessageFlags.Ephemeral });
           }
         }
 
@@ -385,10 +394,14 @@ module.exports = {
       /* ─────────── VIEW ─────────── */
       if (sub === 'view') {
         const eventId = interaction.options.getInteger('event_id');
+        // Defer reply ephemerally. The original logic for conditional ephemerality based on event.status
+        // cannot be perfectly replicated with a single defer then edit, as ephemeral status cannot be removed by editReply.
+        // For simplicity, all views will now be ephemeral via this deferral.
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const event = await linkStore.getEventById(eventId);
         if (!event) {
           const notFoundEmbed = new EmbedBuilder().setColor(0xFFC107).setTitle('🔎 Event Not Found').setDescription(`Event with ID #${eventId} could not be found.`);
-          return interaction.editReply({ embeds: [notFoundEmbed] });
+          return interaction.editReply({ embeds: [notFoundEmbed] }); // Will be ephemeral
         }
         // Fetch and attach custom fields
         event.custom_fields = await linkStore.getEventCustomFields(eventId);
@@ -396,11 +409,13 @@ module.exports = {
         event.rewards = await linkStore.getEventRewards(eventId);
 
         const viewEmbed = buildEventEmbed(event, envConfig);
-        return interaction.editReply({ embeds: [viewEmbed], ephemeral: event.status === 'draft' }); // Ephemeral if draft
+        // The ephemeral: event.status === 'draft' is now redundant here as the reply is already ephemeral.
+        return interaction.editReply({ embeds: [viewEmbed] }); // Will be ephemeral
       }
 
       /* ─────────── PUBLISH (was ANNOUNCE) ─────────── */
       if (sub === 'publish') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // Publish confirmation is ephemeral
         const eventId = interaction.options.getInteger('event_id');
         const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
 
@@ -465,6 +480,7 @@ module.exports = {
 
       /* ─────────── DELETE ─────────── */
       if (sub === 'delete') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // Delete confirmation is ephemeral
         const eventId = interaction.options.getInteger('event_id');
         const eventToDelete = await linkStore.getEventById(eventId);
         if (!eventToDelete) {
@@ -478,6 +494,7 @@ module.exports = {
 
       /* ─────────── EDIT ─────────── */
       if (sub === 'edit') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // Edit menu is ephemeral
         // For Phase 1, editing will be simplified. A full modal approach is better for Phase 2.
         // This will require specific sub-options for each field or a modal.
         // For now, let's make it a placeholder or very basic.
@@ -505,18 +522,20 @@ module.exports = {
 
         currentEventEmbed.setTitle(`✏️ Editing Event: ${eventToEdit.title} (ID #${eventId})`);
         currentEventEmbed.setDescription(`${eventToEdit.description}\n\nSelect an action below to modify the event.`);
-
-        return interaction.editReply({ embeds: [currentEventEmbed], components: [editActionRow], ephemeral: true });
+        // The ephemeral flag here is redundant as the deferReply was already ephemeral.
+        return interaction.editReply({ embeds: [currentEventEmbed], components: [editActionRow] });
       }
 
       /* ─────────── EDIT IMAGE ─────────── */
       if (sub === 'edit_image') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // Edit image confirmation is ephemeral
         const eventId = interaction.options.getInteger('event_id');
         const attachment = interaction.options.getAttachment('image_upload');
         let imageUrl = interaction.options.getString('image_url'); // Can be null or "none"
 
         if (!attachment && !imageUrl) {
-            return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Missing Input').setDescription('Please provide either an image upload or an image URL.')], ephemeral: true });
+            // All editReply calls within this block will inherit the ephemeral status from deferReply.
+            return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Missing Input').setDescription('Please provide either an image upload or an image URL.')] });
         }
 
         const eventToEdit = await linkStore.getEventById(eventId);
@@ -528,10 +547,10 @@ module.exports = {
 
         if (attachment) {
             if (!envConfig.EVENT_ASSET_CHANNEL_ID) {
-              return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Configuration Error').setDescription('Event asset channel is not configured for uploads.')], ephemeral: true });
+              return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Configuration Error').setDescription('Event asset channel is not configured for uploads.')] });
             }
             if (!attachment.contentType || !attachment.contentType.startsWith('image/')) {
-              return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Invalid File Type').setDescription('Please upload a valid image file.')], ephemeral: true });
+              return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Invalid File Type').setDescription('Please upload a valid image file.')] });
             }
             try {
               const assetChannel = await interaction.client.channels.fetch(envConfig.EVENT_ASSET_CHANNEL_ID);
@@ -540,13 +559,13 @@ module.exports = {
               if (!finalImageUrl) throw new Error('Failed to get URL from uploaded attachment.');
             } catch (uploadError) {
               console.error('Failed to upload event image for edit:', uploadError);
-              return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Image Upload Failed').setDescription('Error processing image upload.')], ephemeral: true });
+              return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Image Upload Failed').setDescription('Error processing image upload.')] });
             }
         } else if (imageUrl) {
             if (imageUrl.toLowerCase() === 'none' || imageUrl.toLowerCase() === 'clear') {
                 finalImageUrl = null;
             } else if (!imageUrl.startsWith('http://') && !imageUrl.startsWith('https://')) {
-                 return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Invalid URL').setDescription('Please provide a valid HTTP/HTTPS URL or "none" to clear the image.')], ephemeral: true });
+                 return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Invalid URL').setDescription('Please provide a valid HTTP/HTTPS URL or "none" to clear the image.')] });
             } else {
                 finalImageUrl = imageUrl;
             }
@@ -564,6 +583,7 @@ module.exports = {
 
       /* ─────────── RSVPS (Admin View) ─────────── */
       if (sub === 'rsvps') {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // RSVPs view is ephemeral for admin
         const eventId = interaction.options.getInteger('event_id');
         const event = await linkStore.getEventById(eventId);
 
@@ -601,13 +621,17 @@ module.exports = {
           .setColor(0xE53935) // ERROR_COLOR
           .setTitle('⚠️ Internal Error')
           .setDescription('An unexpected error occurred while processing the command. Please try again later or contact an administrator.');
-        if (interaction.deferred || interaction.replied) {
-          return interaction.followUp({ embeds: [errorEmbed], ephemeral: true });
+
+        // Check if the interaction can be replied to or followed up
+        if (interaction.replied || interaction.deferred) {
+          // If we already replied or deferred (e.g., within a subcommand), followUp.
+          return await interaction.followUp({ embeds: [errorEmbed], flags: MessageFlags.Ephemeral }).catch(console.error);
         } else {
-          return interaction.reply({ embeds: [errorEmbed], ephemeral: true });
+          // Otherwise, try to reply. This is the first acknowledgment.
+          return await interaction.reply({ embeds: [errorEmbed], flags: MessageFlags.Ephemeral }).catch(console.error);
         }
       } catch (secondaryError) {
-        console.error('💥 Error in /events command secondary error handler:', secondaryError);
+        console.error('💥 Error in /events command secondary error handler (likely failed to send error message):', secondaryError);
         /* ignore secondary failures, but log them */
       }
     }
