@@ -79,36 +79,36 @@ module.exports = {
     .addSubcommand(sc =>
       sc.setName('publish')
         .setDescription('Publish a draft event and announce it.')
-        .addIntegerOption(o => o.setName('event_id').setDescription('The ID of the draft event to publish.').setRequired(true))
+        .addStringOption(o => o.setName('event_id').setDescription('The ID (6-char alphanumeric) of the draft event to publish.').setRequired(true).setMinLength(6).setMaxLength(6))
         .addChannelOption(o => o.setName('channel').setDescription('Channel to announce the event in.').setRequired(false))
     )
     .addSubcommand(sc =>
       sc.setName('view')
         .setDescription('View details of a specific event.')
-        .addIntegerOption(o => o.setName('event_id').setDescription('The ID of the event to view.').setRequired(true))
+        .addStringOption(o => o.setName('event_id').setDescription('The ID (6-char alphanumeric) of the event to view.').setRequired(true).setMinLength(6).setMaxLength(6))
     )
     .addSubcommand(sc =>
       sc.setName('delete')
         .setDescription('Delete an event.')
-        .addIntegerOption(o => o.setName('event_id').setDescription('The ID of the event to delete.').setRequired(true))
+        .addStringOption(o => o.setName('event_id').setDescription('The ID (6-char alphanumeric) of the event to delete.').setRequired(true).setMinLength(6).setMaxLength(6))
     )
     .addSubcommand(sc =>
       sc.setName('edit')
         .setDescription('Edit an existing event (basic info, location, custom fields).')
-        .addIntegerOption(o => o.setName('event_id').setDescription('The ID of the event to edit.').setRequired(true))
+        .addStringOption(o => o.setName('event_id').setDescription('The ID (6-char alphanumeric) of the event to edit.').setRequired(true).setMinLength(6).setMaxLength(6))
         // This will now primarily be a gateway to further actions via buttons/modals
     )
     .addSubcommand(subcommand =>
       subcommand.setName('edit_image')
         .setDescription('[Admin] Change or set the main image for an event.')
-        .addIntegerOption(o => o.setName('event_id').setDescription('The ID of the event to update.').setRequired(true))
+        .addStringOption(o => o.setName('event_id').setDescription('The ID (6-char alphanumeric) of the event to update.').setRequired(true).setMinLength(6).setMaxLength(6))
         .addAttachmentOption(o => o.setName('image_upload').setDescription('Upload a new image for the event.').setRequired(false))
         .addStringOption(o => o.setName('image_url').setDescription('Set a new image URL (or "none" to clear).').setRequired(false))
     )
     .addSubcommand(sc =>
       sc.setName('rsvps')
         .setDescription('[Admin] View RSVPs for an event.')
-        .addIntegerOption(o => o.setName('event_id').setDescription('The ID of the event.').setRequired(true))
+        .addStringOption(o => o.setName('event_id').setDescription('The ID (6-char alphanumeric) of the event.').setRequired(true).setMinLength(6).setMaxLength(6))
     )
     .addSubcommandGroup(group =>
       group.setName('template')
@@ -117,7 +117,7 @@ module.exports = {
           sub.setName('create')
             .setDescription('Create a new event template.')
             .addStringOption(o => o.setName('name').setDescription('Unique name for this template.').setRequired(true))
-            .addIntegerOption(o => o.setName('from_event_id').setDescription('Optional: Event ID to base this template on.').setRequired(false))
+            .addStringOption(o => o.setName('from_event_id').setDescription('Optional: Event ID (6-char alphanumeric) to base this template on.').setRequired(false).setMinLength(6).setMaxLength(6))
             // Potentially add more direct options if not basing on from_event_id, or use a modal
         )
         .addSubcommand(sub => sub.setName('list').setDescription('List all available event templates.'))
@@ -184,7 +184,7 @@ module.exports = {
 
         if (sub === 'create') {
             const templateName = interaction.options.getString('name');
-            const fromEventId = interaction.options.getInteger('from_event_id');
+            const fromEventId = interaction.options.getString('from_event_id'); // Changed to getString
 
             let eventDataForTemplate = {};
 
@@ -393,7 +393,7 @@ module.exports = {
 
       /* ─────────── VIEW ─────────── */
       if (sub === 'view') {
-        const eventId = interaction.options.getInteger('event_id');
+        const eventId = interaction.options.getString('event_id'); // Changed to getString
         // Defer reply ephemerally. The original logic for conditional ephemerality based on event.status
         // cannot be perfectly replicated with a single defer then edit, as ephemeral status cannot be removed by editReply.
         // For simplicity, all views will now be ephemeral via this deferral.
@@ -416,7 +416,7 @@ module.exports = {
       /* ─────────── PUBLISH (was ANNOUNCE) ─────────── */
       if (sub === 'publish') {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // Publish confirmation is ephemeral
-        const eventId = interaction.options.getInteger('event_id');
+        const eventId = interaction.options.getString('event_id'); // Changed to getString
         const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
 
         const event = await linkStore.getEventById(eventId);
@@ -481,7 +481,7 @@ module.exports = {
       /* ─────────── DELETE ─────────── */
       if (sub === 'delete') {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // Delete confirmation is ephemeral
-        const eventId = interaction.options.getInteger('event_id');
+        const eventId = interaction.options.getString('event_id'); // Changed to getString
         const eventToDelete = await linkStore.getEventById(eventId);
         if (!eventToDelete) {
             return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Error').setDescription(`Event with ID #${eventId} not found.`)] });
@@ -501,7 +501,7 @@ module.exports = {
         // Example: /events edit event_id:X field:title value:NewTitle
         // This is complex with slash commands for many fields. A modal is the way.
         // For now, just acknowledge and state it's under development for full features.
-         const eventId = interaction.options.getInteger('event_id');
+         const eventId = interaction.options.getString('event_id'); // Changed to getString
          const eventToEdit = await linkStore.getEventById(eventId);
          if (!eventToEdit) {
              return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Error').setDescription(`Event with ID #${eventId} not found.`)] });
@@ -529,7 +529,7 @@ module.exports = {
       /* ─────────── EDIT IMAGE ─────────── */
       if (sub === 'edit_image') {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // Edit image confirmation is ephemeral
-        const eventId = interaction.options.getInteger('event_id');
+        const eventId = interaction.options.getString('event_id'); // Changed to getString
         const attachment = interaction.options.getAttachment('image_upload');
         let imageUrl = interaction.options.getString('image_url'); // Can be null or "none"
 
@@ -584,7 +584,7 @@ module.exports = {
       /* ─────────── RSVPS (Admin View) ─────────── */
       if (sub === 'rsvps') {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // RSVPs view is ephemeral for admin
-        const eventId = interaction.options.getInteger('event_id');
+        const eventId = interaction.options.getString('event_id'); // Changed to getString
         const event = await linkStore.getEventById(eventId);
 
         if (!event) {
@@ -617,18 +617,35 @@ module.exports = {
     } catch (err) {
       console.error('💥 Error in /events command:', err);
       try {
+        // If the error itself is that the interaction is already acknowledged, don't try to send another reply.
+        if (err.code === 40060) { // DiscordAPIError.Codes.InteractionAlreadyReplied is 40060
+          console.warn('[EVENTS_COMMAND_HANDLER] Caught error "InteractionAlreadyReplied", not sending another error message.');
+          return;
+        }
+        // If the error is "Unknown Interaction", it's possible we can't reply either.
+        if (err.code === 10062) { // DiscordAPIError.Codes.UnknownInteraction is 10062
+            console.warn('[EVENTS_COMMAND_HANDLER] Caught error "UnknownInteraction", attempting to log but likely cannot reply.');
+            // Still proceed to try and reply/followUp, as sometimes a followUp might work if a deferral was lost.
+        }
+
         const errorEmbed = new EmbedBuilder()
           .setColor(0xE53935) // ERROR_COLOR
           .setTitle('⚠️ Internal Error')
           .setDescription('An unexpected error occurred while processing the command. Please try again later or contact an administrator.');
 
+        console.log(`[EVENTS_COMMAND_HANDLER] Error caught. Interaction state: replied=${interaction.replied}, deferred=${interaction.deferred}`);
+
         // Check if the interaction can be replied to or followed up
         if (interaction.replied || interaction.deferred) {
-          // If we already replied or deferred (e.g., within a subcommand), followUp.
-          return await interaction.followUp({ embeds: [errorEmbed], flags: MessageFlags.Ephemeral }).catch(console.error);
+          console.log('[EVENTS_COMMAND_HANDLER] Attempting to followUp error message.');
+          return await interaction.followUp({ embeds: [errorEmbed], flags: MessageFlags.Ephemeral }).catch(e => {
+            console.error('[EVENTS_COMMAND_HANDLER] Failed to followUp error message:', e);
+          });
         } else {
-          // Otherwise, try to reply. This is the first acknowledgment.
-          return await interaction.reply({ embeds: [errorEmbed], flags: MessageFlags.Ephemeral }).catch(console.error);
+          console.log('[EVENTS_COMMAND_HANDLER] Attempting to reply with error message.');
+          return await interaction.reply({ embeds: [errorEmbed], flags: MessageFlags.Ephemeral }).catch(e => {
+            console.error('[EVENTS_COMMAND_HANDLER] Failed to reply with error message:', e);
+          });
         }
       } catch (secondaryError) {
         console.error('💥 Error in /events command secondary error handler (likely failed to send error message):', secondaryError);
