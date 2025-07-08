@@ -1,6 +1,6 @@
 {
-  "name": "monkey-linker-bot",
-  "version": "1.1.0",
+  "name": "Broky",
+  "version": "1.4.2",
   "description": "Discord slash-command bot to link Roblox accounts and fetch Monkey Simulator progress",
   "main": "index.js",
   "type": "commonjs",
