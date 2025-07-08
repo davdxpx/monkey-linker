@@ -21,6 +21,7 @@ const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits, ModalBuilder, Te
 const DEBUG = process.env.DEBUG_EVENTS === '1'; // opt‑in verbose logging
 // ADMIN_ROLES are now passed via envConfig from index.js, or use interaction.member.permissions
 // const ADMIN_ROLES = ['👆🏼 Admin', 'Community Manager', 'Admin']; // This will be removed
+const { isBotOwner, isBotAdmin } = require('../utils/permissions'); // Import new permission checkers
 
 function log(...args) {
   if (DEBUG) console.log('[events]', ...args);
@@ -52,14 +53,14 @@ function parseDateTimeToTimestamp(dateStr, timeStr) {
 
 
 /* ─────────────────────────────── Permissions ─────────────────────────────── */
-// Use envConfig.ADMIN_ROLES passed from index.js
-const isEventAdmin = (interaction, adminRolesEnv) => {
-  const member = interaction.member;
-  if (member.permissions.has(PermissionFlagsBits.Administrator)) {
-    return true;
-  }
-  const roles = adminRolesEnv ? adminRolesEnv.split(',').map(r => r.trim()) : [];
-  return member.roles.cache.some(role => roles.includes(role.name) || roles.includes(role.id));
+// Use envConfig.ADMIN_ROLES and envConfig.OWNER_ID passed from index.js
+const isEventAdmin = (interaction, envConfig) => {
+  if (!interaction.member) return false; // Should not happen in guild commands but good check
+  // Check if Bot Owner or Bot Admin (which includes Owner check)
+  return isBotAdmin(interaction.member, envConfig.ADMIN_ROLES, envConfig.OWNER_ID);
+  // The isBotAdmin function already checks for Owner status.
+  // If you also want to allow Discord Server Admins (PermissionFlagsBits.Administrator) regardless of roles/owner:
+  // return interaction.member.permissions.has(PermissionFlagsBits.Administrator) || isBotAdmin(interaction.member, envConfig.ADMIN_ROLES, envConfig.OWNER_ID);
 };
 
 /* ─────────────────────────────── Slash Command ───────────────────────────── */
@@ -160,13 +161,13 @@ module.exports = {
 
       // Permission check for admin-only commands
       // Template commands are also admin only.
-      const adminSubcommands = ['create', 'publish', 'delete', 'edit', 'rsvps'];
+      const adminSubcommands = ['create', 'publish', 'delete', 'edit', 'rsvps', 'edit_image']; // Added edit_image
       const adminGroups = ['template'];
 
       if ((adminSubcommands.includes(sub) && !group) || (group && adminGroups.includes(group))) {
-          if (!isEventAdmin(interaction, envConfig.ADMIN_ROLES)) {
+          if (!isEventAdmin(interaction, envConfig)) { // Pass the whole envConfig
             const noPermsEmbed = new EmbedBuilder().setColor(0xE53935).setTitle('🚫 Permission Denied').setDescription('You do not have the required permissions to use this command/subcommand.');
-            return interaction.editReply({ embeds: [noPermsEmbed] });
+            return interaction.editReply({ embeds: [noPermsEmbed] }); // Assumes deferReply was successful
           }
       }
 

@@ -19,6 +19,7 @@ const {
   DISCORD_TOKEN,
   CLIENT_ID,
   GUILD_ID,
+  OWNER_ID = '', // Added OWNER_ID
   VERIFIED_ROLE_ID,
   ADMIN_ROLES = '',
 
@@ -182,6 +183,16 @@ async function initSqlite(DB_PATH = './links.db') {
       db.exec(`CREATE INDEX IF NOT EXISTS idx_event_rsvps_event_id ON event_rsvps(event_id);`);
       db.exec(`CREATE INDEX IF NOT EXISTS idx_event_rsvps_user_id ON event_rsvps(user_discord_id);`);
       db.exec(`CREATE INDEX IF NOT EXISTS idx_event_custom_fields_event_id ON event_custom_fields(event_id);`);
+
+      // Bot Permissions Table
+      db.exec(`CREATE TABLE IF NOT EXISTS bot_permissions (
+          user_id TEXT PRIMARY KEY,
+          is_moderator INTEGER DEFAULT 0,
+          granted_by_user_id TEXT,
+          granted_at INTEGER
+      );`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_bot_permissions_user_id ON bot_permissions(user_id);`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_bot_permissions_is_moderator ON bot_permissions(is_moderator);`);
 
       // Event Rewards Table
       db.exec(`CREATE TABLE IF NOT EXISTS event_rewards (
@@ -358,6 +369,31 @@ async function initSqlite(DB_PATH = './links.db') {
       },
       deleteEventTemplateByName: (templateName) => {
         return sql.run('DELETE FROM event_templates WHERE template_name = ?', [templateName]);
+      },
+
+      // Bot Permissions Methods (SQLite)
+      grantModeratorRole: (userId, adminUserId) => {
+        const now = Math.floor(Date.now() / 1000);
+        return sql.run(
+          `INSERT INTO bot_permissions (user_id, is_moderator, granted_by_user_id, granted_at) VALUES (?, 1, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET is_moderator = 1, granted_by_user_id = excluded.granted_by_user_id, granted_at = excluded.granted_at`,
+          [userId, adminUserId, now]
+        );
+      },
+      revokeModeratorRole: (userId) => {
+        return sql.run(
+          `UPDATE bot_permissions SET is_moderator = 0 WHERE user_id = ?`,
+          [userId]
+        );
+        // Alternative: Delete the record
+        // return sql.run('DELETE FROM bot_permissions WHERE user_id = ?', [userId]);
+      },
+      isBotModerator: async (userId) => {
+        const row = await sql.get('SELECT is_moderator FROM bot_permissions WHERE user_id = ?', [userId]);
+        return row ? row.is_moderator === 1 : false;
+      },
+      listModerators: () => {
+        return sql.all('SELECT user_id, granted_by_user_id, granted_at FROM bot_permissions WHERE is_moderator = 1 ORDER BY granted_at DESC');
       }
     };
 
@@ -404,6 +440,11 @@ async function initMongoBackend(cfg) {
 
   const eventRewardsCol = db.collection('event_rewards');
   await eventRewardsCol.createIndex({ event_id: 1 });
+
+  const botPermissionsCol = db.collection('bot_permissions');
+  await botPermissionsCol.createIndex({ user_id: 1 }, { unique: true });
+  await botPermissionsCol.createIndex({ is_moderator: 1 });
+
 
   // Note: The linkStore API will need to be expanded to handle these new collections/tables.
   const mongoApi = {
@@ -560,6 +601,30 @@ async function initMongoBackend(cfg) {
     },
     deleteEventTemplateByName: (templateName) => {
         return eventTemplatesCol.deleteOne({ template_name: templateName });
+    },
+
+    // Bot Permissions Methods (MongoDB)
+    grantModeratorRole: (userId, adminUserId) => {
+      const now = Math.floor(Date.now() / 1000);
+      return botPermissionsCol.updateOne(
+        { user_id: userId },
+        { $set: { is_moderator: true, granted_by_user_id: adminUserId, granted_at: now } },
+        { upsert: true }
+      );
+    },
+    revokeModeratorRole: (userId) => {
+      return botPermissionsCol.updateOne(
+        { user_id: userId },
+        { $set: { is_moderator: false } }
+        // We could also add $unset: { granted_by_user_id: "", granted_at: "" } if desired
+      );
+    },
+    isBotModerator: async (userId) => {
+      const userPerm = await botPermissionsCol.findOne({ user_id: userId });
+      return userPerm ? userPerm.is_moderator === true : false;
+    },
+    listModerators: () => {
+      return botPermissionsCol.find({ is_moderator: true }).sort({ granted_at: -1 }).toArray(); // -1 for descending
     }
   };
   return { db, api: mongoApi, dbType: 'mongo' };
@@ -592,18 +657,28 @@ async function selectBackend() {
 // 5 · COMMAND LOADING + REGISTRATION
 //-------------------------------------------------------------------
 function loadCommands() {
-  const files = fs.readdirSync('./commands').filter(f => f.endsWith('.js'));
-  const list = [];
-  for (const f of files) {
-    const filePath = path.join(__dirname, 'commands', f);
-    delete require.cache[require.resolve(filePath)];
-    const cmd = require(filePath);
-    if (!cmd?.data || !cmd?.execute) { warn('Invalid command', f); continue; }
-    client.commands.set(cmd.data.name, cmd);
-    list.push(cmd.data.toJSON());
-    log('Command loaded', cmd.data.name);
+  const commandFiles = fs.readdirSync('./commands').filter(file => file.endsWith('.js'));
+  const commandList = [];
+  console.log('[COMMAND_LOADER] Loading commands...');
+  for (const file of commandFiles) {
+    const filePath = path.join(__dirname, 'commands', file);
+    try {
+      // Clear cache for hot reloading if needed (though full restart is safer for big changes)
+      delete require.cache[require.resolve(filePath)];
+      const command = require(filePath);
+      if (command.data && typeof command.execute === 'function') {
+        client.commands.set(command.data.name, command);
+        commandList.push(command.data.toJSON());
+        console.log(`[COMMAND_LOADER] ✅ Loaded command: ${command.data.name}`);
+      } else {
+        warn(`[COMMAND_LOADER] ⚠️ Command file ${file} is missing 'data' or 'execute'.`);
+      }
+    } catch (error) {
+      console.error(`[COMMAND_LOADER] ❌ Error loading command ${file}:`, error);
+    }
   }
-  return list;
+  console.log(`[COMMAND_LOADER] ${commandList.length} commands prepared for registration.`);
+  return commandList;
 }
 
 async function registerCommands(list) {
@@ -1004,11 +1079,22 @@ client.on('interactionCreate', async interaction => {
   /* ─── eigentliche Command-Ausführung ──────────────── */
   try {
     await cmd.execute(interaction, linkStore, {
+      // Pass all relevant env vars that commands might need
+      DISCORD_TOKEN, // Though commands usually don't need this directly
+      CLIENT_ID,
+      GUILD_ID,
+      OWNER_ID,
       VERIFIED_ROLE_ID,
       ADMIN_ROLES,
       UNIVERSE_ID,
       OC_KEY,
-      GUILD_ID,
+      // Include other necessary env vars from the top-level destructuring if commands need them
+      // For example, EVENT_ASSET_CHANNEL_ID is used by events.js but not destructured at the top.
+      // It's better to pass specific things needed by commands rather than everything.
+      // For now, adding OWNER_ID and ensuring ADMIN_ROLES is passed.
+      // EVENT_ASSET_CHANNEL_ID is handled by events.js directly from process.env for now.
+      // We can refine this envConfig object later if more shared env vars are needed by multiple commands.
+      EVENT_ASSET_CHANNEL_ID: process.env.EVENT_ASSET_CHANNEL_ID, // Example of explicitly passing one
     });
   } catch (err) {
     console.error('Cmd error', err);
