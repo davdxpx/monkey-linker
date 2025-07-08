@@ -129,7 +129,7 @@ async function initSqlite(DB_PATH = './links.db') {
 
       // New Event System Tables
       db.exec(`CREATE TABLE IF NOT EXISTS events (
-          event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id TEXT PRIMARY KEY,
           title TEXT NOT NULL,
           description TEXT,
           creator_discord_id TEXT NOT NULL,
@@ -234,12 +234,14 @@ async function initSqlite(DB_PATH = './links.db') {
 
       // Event methods (SQLite implementations)
       createEvent: (eventData) => {
+        const { generateEventId } = require('./utils/idGenerator');
+        const eventId = generateEventId();
         const { title, description, creator_discord_id, status = 'draft', created_at, updated_at, start_at, end_at, island_name, area_name, image_main_url, image_thumbnail_url, capacity = 0 } = eventData;
         return sql.run(
-          `INSERT INTO events (title, description, creator_discord_id, status, created_at, updated_at, start_at, end_at, island_name, area_name, image_main_url, image_thumbnail_url, capacity)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [title, description, creator_discord_id, status, created_at, updated_at, start_at, end_at, island_name, area_name, image_main_url, image_thumbnail_url, capacity]
-        ).then(function() { return this.lastID; }); // Return the last inserted ID
+          `INSERT INTO events (event_id, title, description, creator_discord_id, status, created_at, updated_at, start_at, end_at, island_name, area_name, image_main_url, image_thumbnail_url, capacity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [eventId, title, description, creator_discord_id, status, created_at, updated_at, start_at, end_at, island_name, area_name, image_main_url, image_thumbnail_url, capacity]
+        ).then(() => eventId); // Return the generated eventId
       },
       getEventById: (eventId) => sql.get('SELECT * FROM events WHERE event_id = ?', [eventId]),
       getPublishedEvents: (limit = 25) => sql.all('SELECT * FROM events WHERE status = ? ORDER BY start_at ASC LIMIT ?', ['published', limit]),
@@ -465,21 +467,26 @@ async function initMongoBackend(cfg) {
 
     // Event methods (MongoDB implementations)
     createEvent: async (eventData) => {
-      const result = await eventsCol.insertOne(eventData);
-      return result.insertedId;
+      const { generateEventId } = require('./utils/idGenerator');
+      const eventId = generateEventId();
+      const fullEventData = { ...eventData, _id: eventId, event_id: eventId }; // Use generated ID as _id and event_id
+      await eventsCol.insertOne(fullEventData);
+      return eventId; // Return the generated eventId
     },
-    getEventById: (eventId) => eventsCol.findOne({ _id: eventId }), // Assuming eventId is ObjectId for Mongo
+    getEventById: (eventId) => eventsCol.findOne({ _id: eventId }), // Now eventId is our string ID
     getPublishedEvents: (limit = 25) => eventsCol.find({ status: 'published' }).sort({ start_at: 1 }).limit(limit).toArray(),
     updateEventStatus: (eventId, status, updated_at) => eventsCol.updateOne({ _id: eventId }, { $set: { status, updated_at } }),
     deleteEvent: async function(eventId) { // Use function keyword for 'this' context
-        await this.deleteEventCustomFieldsByEventId(eventId);
+        await this.deleteEventCustomFieldsByEventId(eventId); // Assumes these use event_id matching _id
         await this.deleteEventRsvpsByEventId(eventId);
         // Future: await this.deleteEventRewardsByEventId(eventId);
-        return eventsCol.deleteOne({ _id: eventId }); // Ensure eventId is ObjectId if needed for direct _id match
+        return eventsCol.deleteOne({ _id: eventId });
     },
     updateEvent: (eventId, eventData) => {
         const updatePayload = { ...eventData };
-        delete updatePayload._id; // Cannot update _id
+        // _id should not be in eventData if we are identifying by it in query
+        delete updatePayload._id;
+        delete updatePayload.event_id; // also remove event_id if present, as it's same as _id
         updatePayload.updated_at = Math.floor(Date.now() / 1000);
         return eventsCol.updateOne({ _id: eventId }, { $set: updatePayload });
     },
@@ -699,6 +706,9 @@ client.on('interactionCreate', async interaction => {
   if (interaction.isModalSubmit()) {
     if (interaction.customId === 'eventCreateModal') {
       try {
+      // Defer reply immediately for modal submission
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
       const title = interaction.fields.getTextInputValue('eventTitle');
       const description = interaction.fields.getTextInputValue('eventDescription');
       const dateStr = interaction.fields.getTextInputValue('eventDate');
@@ -796,7 +806,7 @@ client.on('interactionCreate', async interaction => {
       components.push(manageButtonsRow);
 
 
-      await interaction.reply({ embeds: [successEmbed], components: components, flags: MessageFlags.Ephemeral });
+      await interaction.editReply({ embeds: [successEmbed], components: components }); // Ephemeral flag is inherited from deferReply
 
       if (pendingData) {
         client.pendingEventCreations.delete(interaction.user.id); // Clean up
@@ -813,7 +823,7 @@ client.on('interactionCreate', async interaction => {
     }
    } else if (interaction.customId.startsWith('customFieldAddModal-')) {
       try {
-        const eventId = parseInt(interaction.customId.split('-')[1], 10);
+        const eventId = interaction.customId.split('-')[1]; // Event ID is now a string
         const fieldName = interaction.fields.getTextInputValue('customFieldName');
         const fieldValue = interaction.fields.getTextInputValue('customFieldValue');
         const displayOrderStr = interaction.fields.getTextInputValue('customFieldDisplayOrder');
@@ -838,7 +848,7 @@ client.on('interactionCreate', async interaction => {
       }
     } else if (interaction.customId.startsWith('eventRewardAddModal-')) {
       try {
-        const eventId = parseInt(interaction.customId.split('-')[1], 10);
+        const eventId = interaction.customId.split('-')[1]; // Event ID is now a string
         const name = interaction.fields.getTextInputValue('rewardName');
         const description = interaction.fields.getTextInputValue('rewardDescription') || null;
         const imageUrl = interaction.fields.getTextInputValue('rewardImageUrl') || null;
@@ -871,8 +881,8 @@ client.on('interactionCreate', async interaction => {
     const eventIdStr = customIdParts[2]; // This might be eventId or part of a more complex customId
 
     if (prefix === 'rsvp' && eventIdStr) {
-      const eventId = parseInt(eventIdStr, 10);
-      const rsvpStatus = action; // 'going', 'interested', 'cantgo'
+      const eventId = eventIdStr; // Event ID is now a string
+      const rsvpStatusType = action; // 'going', 'interested', 'cantgo' - Renamed to avoid conflict
       try {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const userId = interaction.user.id;
@@ -929,7 +939,8 @@ client.on('interactionCreate', async interaction => {
       }
     } else if (prefix === 'manage' && action === 'custom' && customIdParts[2] === 'fields' && customIdParts[3]) {
         // manage-custom-fields-<eventId>
-        const eventId = parseInt(customIdParts[3], 10);
+        const eventId = customIdParts[3]; // Event ID is now a string
+        await interaction.deferUpdate(); // Defer update before showing modal
         const { ModalBuilder, TextInputBuilder, ActionRowBuilder } = require('discord.js'); // Ensure they are in scope
         const modal = new ModalBuilder()
             .setCustomId(`customFieldAddModal-${eventId}`)
@@ -942,11 +953,13 @@ client.on('interactionCreate', async interaction => {
         // The original interaction (button click) is ephemeral, so no explicit reply needed here as modal takes over.
     } else if (prefix === 'custom' && action === 'field' && customIdParts[2] === 'finish' && customIdParts[3]) {
         // custom-field-finish-<eventId>
-        const eventIdCf = parseInt(customIdParts[3], 10); // Renamed to avoid conflict
-        await interaction.update({ content: `Finished adding custom fields for Event #${eventIdCf}. You can publish or further edit the event.`, components: [] });
+        const eventIdCf = customIdParts[3]; // Event ID is now a string
+        await interaction.deferUpdate();
+        await interaction.editReply({ content: `Finished adding custom fields for Event #${eventIdCf}. You can publish or further edit the event.`, components: [] });
     } else if (prefix === 'edit' && action === 'location' && eventIdStr) {
         // edit-location-<eventId>
-        const eventId = parseInt(eventIdStr, 10);
+        const eventId = eventIdStr; // Event ID is now a string
+        await interaction.deferUpdate(); // Defer update before sending new components
         const { ISLAND_DATA } = require('./utils/gameData.js');
         const islandOptions = Object.keys(ISLAND_DATA).map(key => ({
             label: `${ISLAND_DATA[key].emoji} ${key}`,
@@ -962,11 +975,12 @@ client.on('interactionCreate', async interaction => {
         // interaction.update is for the component's message. If the original /events edit reply had components, this would update it.
         // If it was just an embed, we might need to send a new message or ensure the original interaction can be updated.
         // For simplicity with ephemeral, we can use editReply on the button's interaction.
-        await interaction.update({ content: `Changing location for Event #${eventId}. Please select the new island.`, embeds: [], components: [row] });
+        await interaction.editReply({ content: `Changing location for Event #${eventId}. Please select the new island.`, embeds: [], components: [row] });
 
     } else if (prefix === 'manage' && action === 'event' && customIdParts[2] === 'rewards' && customIdParts[3]) {
         // manage-event-rewards-<eventId>
-        const eventId = parseInt(customIdParts[3], 10); // Renamed to avoid conflict
+        const eventId = customIdParts[3]; // Event ID is now a string
+        await interaction.deferUpdate(); // Defer update before showing modal
         const { ModalBuilder, TextInputBuilder, ActionRowBuilder } = require('discord.js');
         const modal = new ModalBuilder()
             .setCustomId(`eventRewardAddModal-${eventId}`)
@@ -985,8 +999,9 @@ client.on('interactionCreate', async interaction => {
         await interaction.showModal(modal);
     } else if (prefix === 'reward' && action === 'finish' && customIdParts[2]) {
         // reward-finish-<eventId>
-        const eventId = parseInt(customIdParts[2], 10);
-        await interaction.update({ content: `Finished adding rewards for Event #${eventId}.`, components: [] });
+        const eventId = customIdParts[2]; // Event ID is now a string
+        await interaction.deferUpdate();
+        await interaction.editReply({ content: `Finished adding rewards for Event #${eventId}.`, components: [] });
     }
     // Other button interactions can be handled here
   } else if (interaction.isStringSelectMenu()) {
@@ -994,10 +1009,11 @@ client.on('interactionCreate', async interaction => {
     const customIdParts = interaction.customId.split('-');
     const type = customIdParts[0]; // 'select'
     const entity = customIdParts[1]; // 'island' or 'area'
-    const eventId = parseInt(customIdParts[2], 10);
+    const eventId = customIdParts[2]; // Event ID is now a string
 
     if (entity === 'island' && eventId) {
         try {
+            await interaction.deferUpdate(); // Defer update for select menu
             const selectedIsland = interaction.values[0];
             await linkStore.updateEvent(eventId, { island_name: selectedIsland });
 
@@ -1024,14 +1040,15 @@ client.on('interactionCreate', async interaction => {
                 followupComponents.push(manageButtonsRow);
             }
             // Update the message that contained the island select menu
-            await interaction.update({ content: followupMessage, components: followupComponents });
+            await interaction.editReply({ content: followupMessage, components: followupComponents });
 
         } catch (islandSelectError) {
             console.error(`Error processing island select for event ${eventId}:`, islandSelectError);
-            await interaction.update({ content: 'There was an error setting the island. Please try again.', components: [] }).catch(()=>{});
+            await interaction.editReply({ content: 'There was an error setting the island. Please try again.', components: [] }).catch(()=>{});
         }
     } else if (entity === 'area' && eventId) {
         try {
+            await interaction.deferUpdate(); // Defer update for select menu
             const selectedArea = interaction.values[0];
             // islandName might be part of customIdParts[3] if needed for context, e.g. customId: select-area-<eventId>-<islandName>
             // const islandName = customIdParts[3];
@@ -1046,10 +1063,10 @@ client.on('interactionCreate', async interaction => {
                     new ButtonBuilder().setCustomId(`manage-event-rewards-${eventId}`).setLabel('Manage Rewards').setStyle(2)
                 );
 
-            await interaction.update({ content: finalMessage, components: [manageButtonsRow] });
+            await interaction.editReply({ content: finalMessage, components: [manageButtonsRow] });
         } catch (areaSelectError) {
             console.error(`Error processing area select for event ${eventId}:`, areaSelectError);
-            await interaction.update({ content: 'There was an error setting the area. Please try again.', components: [] }).catch(()=>{});
+            await interaction.editReply({ content: 'There was an error setting the area. Please try again.', components: [] }).catch(()=>{});
         }
     }
   }
