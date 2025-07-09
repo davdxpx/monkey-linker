@@ -15,7 +15,7 @@
 
 'use strict';
 
-const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits, ModalBuilder, TextInputBuilder, ActionRowBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder, MessageFlags } = require('discord.js');
+const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits, ModalBuilder, TextInputBuilder, ActionRowBuilder, StringSelectMenuBuilder, StringSelectMenuOptionBuilder, MessageFlags, ButtonBuilder } = require('discord.js'); // Added ButtonBuilder
 // Removed fs, path, DB_PATH, loadEvents, saveEvents
 
 const DEBUG = process.env.DEBUG_EVENTS === '1'; // opt‑in verbose logging
@@ -78,9 +78,9 @@ module.exports = {
     )
     .addSubcommand(sc =>
       sc.setName('publish')
-        .setDescription('Publish a draft event and announce it.')
-        .addStringOption(o => o.setName('event_id').setDescription('The ID (6-char alphanumeric) of the draft event to publish.').setRequired(true).setMinLength(6).setMaxLength(6))
-        .addChannelOption(o => o.setName('channel').setDescription('Channel to announce the event in.').setRequired(false))
+        .setDescription('Publish a draft event by selecting it from a list.')
+        // event_id option removed, will use a select menu
+        .addChannelOption(o => o.setName('channel').setDescription('Channel to announce the event in. (Optional, defaults to current channel)').setRequired(false))
     )
     .addSubcommand(sc =>
       sc.setName('view')
@@ -415,67 +415,45 @@ module.exports = {
 
       /* ─────────── PUBLISH (was ANNOUNCE) ─────────── */
       if (sub === 'publish') {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral }); // Publish confirmation is ephemeral
-        const eventId = interaction.options.getString('event_id'); // Changed to getString
-        const targetChannel = interaction.options.getChannel('channel') || interaction.channel;
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const targetChannel = interaction.options.getChannel('channel') || interaction.channel; // Optional channel
 
-        const event = await linkStore.getEventById(eventId);
-        if (!event) {
-            return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Error').setDescription(`Event with ID #${eventId} not found.`)] });
-        }
-        if (event.status === 'published') {
-            return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Already Published').setDescription(`Event #${eventId} is already published.`)] });
+        // Fetch draft events
+        const draftEvents = await linkStore.getDraftEvents(); // Assumes new method in linkStore
+
+        if (!draftEvents || draftEvents.length === 0) {
+          return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('ℹ️ No Draft Events').setDescription('There are no draft events available to publish.')] });
         }
 
-        const now = Math.floor(Date.now() / 1000);
+        if (draftEvents.length > 25) {
+            // Discord select menus can have max 25 options.
+            // Consider pagination or other UI if more than 25 drafts. For now, slice.
+            draftEvents.splice(25);
+             // Potentially inform user that list is truncated
+        }
 
-        // Fetch event data again to ensure it's fresh before building embed, or merge if updateEventStatus doesn't return it
-        let eventToPublish = await linkStore.getEventById(eventId); // Get latest data including any prior edits
-        if (!eventToPublish) { /* Should not happen if previous checks passed */ }
-
-        await linkStore.updateEventStatus(eventId, 'published', now);
-        eventToPublish.status = 'published'; // Reflect status change for embed
-        eventToPublish.updated_at = now;
-
-        // Fetch and attach custom fields for the announcement
-        eventToPublish.custom_fields = await linkStore.getEventCustomFields(eventId);
-        // Fetch and attach rewards for the announcement
-        eventToPublish.rewards = await linkStore.getEventRewards(eventId);
-
-        const announcementEmbed = buildEventEmbed(eventToPublish, envConfig);
-
-        const rsvpRow = new ActionRowBuilder()
-            .addComponents(
-                new ButtonBuilder()
-                    .setCustomId(`rsvp-going-${eventId}`)
-                    .setLabel('Going')
-                    .setStyle(3) // Green - Success
-                    .setEmoji('✅'),
-                new ButtonBuilder()
-                    .setCustomId(`rsvp-interested-${eventId}`)
-                    .setLabel('Interested')
-                    .setStyle(1) // Blue - Primary
-                    .setEmoji('🤔'),
-                new ButtonBuilder()
-                    .setCustomId(`rsvp-cantgo-${eventId}`)
-                    .setLabel('Can\'t Go')
-                    .setStyle(4) // Red - Danger
-                    .setEmoji('❌')
-            );
-
-        const announcementMsg = await targetChannel.send({ embeds: [announcementEmbed], components: [rsvpRow] });
-
-        // Store message ID for future updates (e.g., RSVP counts)
-        // Also ensure the event object used for the embed has the latest status
-        await linkStore.updateEvent(eventId, {
-            announcement_message_id: announcementMsg.id,
-            announcement_channel_id: targetChannel.id,
-            status: 'published', // Ensure status is set here if updateEventStatus doesn't return the object
-            updated_at: now
+        const options = draftEvents.map(event => {
+          let label = event.title.substring(0, 90); // Max label length is 100
+          // Include a bit of description or date if title is too generic, or just ID
+          return new StringSelectMenuOptionBuilder()
+            .setLabel(`${label} (ID: ${event.event_id})`)
+            .setValue(`${event.event_id}_channel_${targetChannel.id}`); // Pass eventId and targetChannelId
+            // Description could be `Starts: <t:${event.start_at}:R>`
         });
 
-        const successEmbed = new EmbedBuilder().setColor(0x4CAF50).setTitle('📢 Event Published').setDescription(`Event **${event.title}** (ID #${eventId}) has been successfully published to ${targetChannel}.`);
-        return interaction.editReply({ embeds: [successEmbed] });
+        const selectMenu = new StringSelectMenuBuilder()
+          .setCustomId('select_event_to_publish') // This ID will be handled in index.js
+          .setPlaceholder('Select an event to publish...')
+          .addOptions(options);
+
+        const row = new ActionRowBuilder().addComponents(selectMenu);
+        const selectEmbed = new EmbedBuilder()
+            .setColor(0x00BCD4)
+            .setTitle('📝 Publish an Event')
+            .setDescription('Please select a draft event from the list below to publish.');
+
+        return interaction.editReply({ embeds: [selectEmbed], components: [row] });
+        // The actual publishing logic will be handled by the select menu interaction in index.js
       }
 
       /* ─────────── DELETE ─────────── */
@@ -653,6 +631,7 @@ module.exports = {
       }
     }
   },
+  buildEventEmbed: buildEventEmbed // Attach buildEventEmbed to the exported object
 };
 
 /* ─────────────────────────────── Helper Embeds ───────────────────────────── */
@@ -704,3 +683,5 @@ function buildEventEmbed(event, envConfig) { // envConfig might be useful for gl
 
   return embed;
 }
+
+// module.exports.buildEventEmbed = buildEventEmbed; // Removed this line
