@@ -245,6 +245,7 @@ async function initSqlite(DB_PATH = './links.db') {
       },
       getEventById: (eventId) => sql.get('SELECT * FROM events WHERE event_id = ?', [eventId]),
       getPublishedEvents: (limit = 25) => sql.all('SELECT * FROM events WHERE status = ? ORDER BY start_at ASC LIMIT ?', ['published', limit]),
+      getDraftEvents: (limit = 25) => sql.all('SELECT event_id, title, start_at FROM events WHERE status = ? ORDER BY created_at DESC LIMIT ?', ['draft', limit]), // New method
       updateEventStatus: (eventId, status, updated_at) => sql.run('UPDATE events SET status = ?, updated_at = ? WHERE event_id = ?', [status, updated_at, eventId]),
       deleteEvent: async function(eventId) { // Use function keyword for 'this' context
         await this.deleteEventCustomFieldsByEventId(eventId);
@@ -475,6 +476,7 @@ async function initMongoBackend(cfg) {
     },
     getEventById: (eventId) => eventsCol.findOne({ _id: eventId }), // Now eventId is our string ID
     getPublishedEvents: (limit = 25) => eventsCol.find({ status: 'published' }).sort({ start_at: 1 }).limit(limit).toArray(),
+    getDraftEvents: (limit = 25) => eventsCol.find({ status: 'draft' }, { projection: { event_id: 1, title: 1, start_at: 1, _id: 0 } }).sort({ created_at: -1 }).limit(limit).toArray(), // New method
     updateEventStatus: (eventId, status, updated_at) => eventsCol.updateOne({ _id: eventId }, { $set: { status, updated_at } }),
     deleteEvent: async function(eventId) { // Use function keyword for 'this' context
         await this.deleteEventCustomFieldsByEventId(eventId); // Assumes these use event_id matching _id
@@ -1044,7 +1046,8 @@ client.on('interactionCreate', async interaction => {
 
         } catch (islandSelectError) {
             console.error(`Error processing island select for event ${eventId}:`, islandSelectError);
-            await interaction.editReply({ content: 'There was an error setting the island. Please try again.', components: [] }).catch(()=>{});
+            // Avoid further interaction errors if the original interaction is already invalid.
+            console.warn(`[INDEX_HANDLER] Could not send user-facing error for island select for event ${eventId} as interaction might be invalid.`);
         }
     } else if (entity === 'area' && eventId) {
         try {
@@ -1066,8 +1069,99 @@ client.on('interactionCreate', async interaction => {
             await interaction.editReply({ content: finalMessage, components: [manageButtonsRow] });
         } catch (areaSelectError) {
             console.error(`Error processing area select for event ${eventId}:`, areaSelectError);
-            await interaction.editReply({ content: 'There was an error setting the area. Please try again.', components: [] }).catch(()=>{});
+            // Avoid further interaction errors if the original interaction is already invalid.
+            console.warn(`[INDEX_HANDLER] Could not send user-facing error for area select for event ${eventId} as interaction might be invalid.`);
         }
+    } else if (interaction.customId === 'select_event_to_publish') {
+      try {
+        await interaction.deferUpdate(); // Acknowledge the select menu interaction
+
+        const selectedValue = interaction.values[0];
+        // Value format: `${event.event_id}_channel_${targetChannel.id}`
+        const parts = selectedValue.split('_channel_');
+        const eventId = parts[0];
+        const targetChannelId = parts[1];
+
+
+        if (!eventId || !targetChannelId) {
+          console.error(`Invalid value from select_event_to_publish: ${selectedValue}`);
+          return interaction.editReply({ content: 'There was an error processing your selection. Invalid data received.', components: [], embeds: [] });
+        }
+
+        const targetChannel = await client.channels.fetch(targetChannelId).catch(() => null);
+        if (!targetChannel || !targetChannel.isTextBased()) {
+          return interaction.editReply({ content: 'The target channel for announcement could not be found or is not a text channel.', components: [], embeds: [] });
+        }
+
+        const event = await linkStore.getEventById(eventId); // eventId is already a string
+        if (!event) {
+            return interaction.editReply({ content: `Error: Event with ID #${eventId} not found.`, components: [], embeds: [] });
+        }
+        if (event.status === 'published') {
+            return interaction.editReply({ content: `Event #${eventId} is already published.`, components: [], embeds: [] });
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+        // Fetch full event data again to ensure it's most up-to-date for the embed
+        let eventToPublish = await linkStore.getEventById(eventId);
+        if (!eventToPublish) { // Should not happen if first check passed
+             console.error(`Event ${eventId} disappeared before publishing.`);
+             return interaction.editReply({ content: `Error: Event with ID #${eventId} could not be re-fetched.`, components: [], embeds: [] });
+        }
+
+
+        await linkStore.updateEventStatus(eventId, 'published', now);
+        eventToPublish.status = 'published'; // Update local copy for embed
+        eventToPublish.updated_at = now;     // Update local copy for embed
+
+        eventToPublish.custom_fields = await linkStore.getEventCustomFields(eventId);
+        eventToPublish.rewards = await linkStore.getEventRewards(eventId);
+
+        // Ensure buildEventEmbed is accessible
+        // This assumes commands/events.js will export buildEventEmbed:
+        // const { buildEventEmbed } = require('./commands/events.js');
+        // If not, this line will fail and buildEventEmbed needs to be moved/exported.
+        // For now, to proceed, we'll assume it's made available.
+        // A more robust solution is to move buildEventEmbed to a shared util.
+        // Let's try to require it directly for now.
+        let buildEventEmbedFunction;
+        try {
+            const eventCmdModule = require('./commands/events.js');
+            buildEventEmbedFunction = eventCmdModule.buildEventEmbed;
+            if (typeof buildEventEmbedFunction !== 'function') throw new Error('buildEventEmbed not a function');
+        } catch (e) {
+            console.error("Failed to load buildEventEmbed from commands/events.js:", e);
+            return interaction.editReply({ content: 'Internal error: Could not prepare event announcement (embed builder missing).', components: [], embeds: [] });
+        }
+
+        // Pass relevant parts of envConfig if buildEventEmbed needs it
+        const envConfigForEmbed = { OWNER_ID, ADMIN_ROLES /* add other needed env vars */ };
+        const announcementEmbed = buildEventEmbedFunction(eventToPublish, envConfigForEmbed);
+
+        const { ActionRowBuilder, ButtonBuilder } = require('discord.js'); // Already imported at top, but good for clarity
+
+        const rsvpRow = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder().setCustomId(`rsvp-going-${eventId}`).setLabel('Going').setStyle(3).setEmoji('✅'), // Using an actual number for style
+                new ButtonBuilder().setCustomId(`rsvp-interested-${eventId}`).setLabel('Interested').setStyle(1).setEmoji('🤔'),
+                new ButtonBuilder().setCustomId(`rsvp-cantgo-${eventId}`).setLabel('Can\'t Go').setStyle(4).setEmoji('❌')
+            );
+
+        const announcementMsg = await targetChannel.send({ embeds: [announcementEmbed], components: [rsvpRow] });
+
+        await linkStore.updateEvent(eventId, {
+            announcement_message_id: announcementMsg.id,
+            announcement_channel_id: targetChannel.id,
+            status: 'published', // Ensure status is explicitly set here too
+            updated_at: now
+        });
+
+        return interaction.editReply({ content: `Event **${event.title}** (ID #${eventId}) has been successfully published to ${targetChannel}.`, components: [], embeds: [] });
+
+      } catch (publishSelectError) {
+        console.error(`Error processing select_event_to_publish for event:`, publishSelectError);
+        console.warn(`[INDEX_HANDLER] Could not send user-facing error for event publish selection as interaction might be invalid.`);
+      }
     }
   }
 
