@@ -432,19 +432,52 @@ module.exports = {
              // Potentially inform user that list is truncated
         }
 
-        const options = draftEvents.map(event => {
-          let label = event.title.substring(0, 90); // Max label length is 100
-          // Include a bit of description or date if title is too generic, or just ID
-          return new StringSelectMenuOptionBuilder()
-            .setLabel(`${label} (ID: ${event.event_id})`)
-            .setValue(`${event.event_id}_channel_${targetChannel.id}`); // Pass eventId and targetChannelId
-            // Description could be `Starts: <t:${event.start_at}:R>`
-        });
+        const options = [];
+        const addedEventIds = new Set(); // Keep track of added event IDs
+
+        for (const event of draftEvents) {
+            if (addedEventIds.has(event.event_id)) {
+                // Skip this event if its ID has already been added, to prevent duplicate values
+                log(`Skipping duplicate event ID for select menu: ${event.event_id}`);
+                continue;
+            }
+
+            let label = event.title.substring(0, 80); // Shorten label slightly
+            // Ensure unique label by appending ID, useful if titles are similar
+            label = `${label} (ID: ${event.event_id})`;
+
+            // Value must be unique, event_id + channel_id is good, as channel_id is constant per command invocation.
+            const optionValue = `${event.event_id}_channel_${targetChannel.id}`;
+
+            options.push(
+                new StringSelectMenuOptionBuilder()
+                    .setLabel(label.substring(0,100)) // Ensure label is not > 100 chars
+                    .setValue(optionValue.substring(0,100)) // Ensure value is not > 100 chars
+            );
+            addedEventIds.add(event.event_id);
+
+            if (options.length >= 25) {
+                log('Reached max 25 options for select menu.');
+                break;
+            }
+        }
+
+        // Check if options array is empty after deduplication or if no drafts initially
+        if (options.length === 0) {
+            let message = 'There are no draft events available to publish.';
+            if (draftEvents.length > 0) { // This means all were duplicates or filtered out
+                message = 'Could not find any unique draft events to publish. This might indicate a data issue or all drafts were duplicates.';
+            }
+            return interaction.editReply({
+                embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('ℹ️ No Events to Publish').setDescription(message)],
+                components: []
+            });
+        }
 
         const selectMenu = new StringSelectMenuBuilder()
-          .setCustomId('select_event_to_publish') // This ID will be handled in index.js
+          .setCustomId('select_event_to_publish')
           .setPlaceholder('Select an event to publish...')
-          .addOptions(options);
+          .addOptions(options); // options is now an array of StringSelectMenuOptionBuilder instances
 
         const row = new ActionRowBuilder().addComponents(selectMenu);
         const selectEmbed = new EmbedBuilder()
