@@ -206,6 +206,27 @@ async function initSqlite(DB_PATH = './links.db') {
           FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
       );`);
       db.exec(`CREATE INDEX IF NOT EXISTS idx_event_rewards_event_id ON event_rewards(event_id);`);
+
+      // Global Reward Types Table
+      db.exec(`CREATE TABLE IF NOT EXISTS global_reward_types (
+          reward_type_id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          description TEXT,
+          creator_discord_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+      );`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_global_reward_types_name ON global_reward_types(name);`);
+
+      // RSVP Role Configuration Table (Singleton)
+      db.exec(`CREATE TABLE IF NOT EXISTS rsvp_role_config (
+          config_id INTEGER PRIMARY KEY DEFAULT 1, -- Ensures only one row
+          role_id TEXT NOT NULL,
+          set_by_user_id TEXT NOT NULL,
+          set_at INTEGER NOT NULL,
+          CONSTRAINT rsvp_role_config_singleton CHECK (config_id = 1)
+      );`);
+
     });
 
     const sql = wrapSql(db);
@@ -398,7 +419,61 @@ async function initSqlite(DB_PATH = './links.db') {
       },
       listModerators: () => {
         return sql.all('SELECT user_id, granted_by_user_id, granted_at FROM bot_permissions WHERE is_moderator = 1 ORDER BY granted_at DESC');
-      }
+      },
+
+      // Global Reward Type Methods (SQLite)
+      createGlobalRewardType: (rewardTypeId, name, description, creatorId) => {
+        const now = Math.floor(Date.now() / 1000);
+        return sql.run(
+          `INSERT INTO global_reward_types (reward_type_id, name, description, creator_discord_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [rewardTypeId, name, description, creatorId, now, now]
+        );
+      },
+      getGlobalRewardTypeById: (id) => {
+        return sql.get('SELECT * FROM global_reward_types WHERE reward_type_id = ?', [id]);
+      },
+      getGlobalRewardTypeByName: (name) => {
+        return sql.get('SELECT * FROM global_reward_types WHERE name = ?', [name]);
+      },
+      getAllGlobalRewardTypes: () => {
+        return sql.all('SELECT * FROM global_reward_types ORDER BY name ASC');
+      },
+      updateGlobalRewardType: (id, name, description) => {
+        const now = Math.floor(Date.now() / 1000);
+        // Ensure that only provided fields are updated.
+        const updates = [];
+        const values = [];
+        if (name !== undefined) { updates.push('name = ?'); values.push(name); }
+        if (description !== undefined) { updates.push('description = ?'); values.push(description); }
+
+        if (updates.length === 0) return Promise.resolve(); // No fields to update
+
+        updates.push('updated_at = ?');
+        values.push(now);
+        values.push(id);
+
+        return sql.run(`UPDATE global_reward_types SET ${updates.join(', ')} WHERE reward_type_id = ?`, values);
+      },
+      deleteGlobalRewardType: (id) => {
+        return sql.run('DELETE FROM global_reward_types WHERE reward_type_id = ?', [id]);
+      },
+
+      // RSVP Role Config Methods (SQLite)
+      setRsvpRole: (roleId, adminUserId) => {
+        const now = Math.floor(Date.now() / 1000);
+        return sql.run(
+          `INSERT OR REPLACE INTO rsvp_role_config (config_id, role_id, set_by_user_id, set_at)
+           VALUES (1, ?, ?, ?)`, // config_id is always 1
+          [roleId, adminUserId, now]
+        );
+      },
+      getRsvpRole: () => {
+        return sql.get('SELECT role_id, set_by_user_id, set_at FROM rsvp_role_config WHERE config_id = 1');
+      },
+      clearRsvpRole: () => {
+        return sql.run('DELETE FROM rsvp_role_config WHERE config_id = 1');
+      },
     };
 
     // ⏰ Periodische Bereinigung: nicht verifizierte Links nach 15 min löschen
@@ -448,6 +523,13 @@ async function initMongoBackend(cfg) {
   const botPermissionsCol = db.collection('bot_permissions');
   await botPermissionsCol.createIndex({ user_id: 1 }, { unique: true });
   await botPermissionsCol.createIndex({ is_moderator: 1 });
+
+  const globalRewardTypesCol = db.collection('global_reward_types');
+  await globalRewardTypesCol.createIndex({ name: 1 }, { unique: true });
+  await globalRewardTypesCol.createIndex({ reward_type_id: 1 }, { unique: true });
+
+  const rsvpRoleConfigCol = db.collection('rsvp_role_config');
+  // No specific index needed if we always query by a known _id like "current_config"
 
 
   // Note: The linkStore API will need to be expanded to handle these new collections/tables.
@@ -635,7 +717,64 @@ async function initMongoBackend(cfg) {
     },
     listModerators: () => {
       return botPermissionsCol.find({ is_moderator: true }).sort({ granted_at: -1 }).toArray(); // -1 for descending
-    }
+    },
+
+    // Global Reward Type Methods (MongoDB)
+    createGlobalRewardType: async (rewardTypeId, name, description, creatorId) => {
+      const now = Math.floor(Date.now() / 1000);
+      await globalRewardTypesCol.insertOne({
+        _id: rewardTypeId, // Use rewardTypeId as MongoDB _id
+        reward_type_id: rewardTypeId,
+        name,
+        description,
+        creator_discord_id: creatorId,
+        created_at: now,
+        updated_at: now,
+      });
+      return rewardTypeId;
+    },
+    getGlobalRewardTypeById: (id) => {
+      return globalRewardTypesCol.findOne({ _id: id });
+    },
+    getGlobalRewardTypeByName: (name) => {
+      return globalRewardTypesCol.findOne({ name: name });
+    },
+    getAllGlobalRewardTypes: () => {
+      return globalRewardTypesCol.find({}).sort({ name: 1 }).toArray();
+    },
+    updateGlobalRewardType: (id, name, description) => {
+      const now = Math.floor(Date.now() / 1000);
+      const updates = { updated_at: now };
+      if (name !== undefined) updates.name = name;
+      if (description !== undefined) updates.description = description;
+
+      if (Object.keys(updates).length <= 1) return Promise.resolve(); // Only updated_at, no actual change
+
+      return globalRewardTypesCol.updateOne({ _id: id }, { $set: updates });
+    },
+    deleteGlobalRewardType: (id) => {
+      return globalRewardTypesCol.deleteOne({ _id: id });
+    },
+
+    // RSVP Role Config Methods (MongoDB)
+    setRsvpRole: (roleId, adminUserId) => {
+      const now = Math.floor(Date.now() / 1000);
+      return rsvpRoleConfigCol.updateOne(
+        { _id: 'current_config' }, // Use a fixed _id for the singleton document
+        { $set: { role_id: roleId, set_by_user_id: adminUserId, set_at: now } },
+        { upsert: true }
+      );
+    },
+    getRsvpRole: async () => {
+      const config = await rsvpRoleConfigCol.findOne({ _id: 'current_config' });
+      if (config) {
+        return { role_id: config.role_id, set_by_user_id: config.set_by_user_id, set_at: config.set_at };
+      }
+      return null;
+    },
+    clearRsvpRole: () => {
+      return rsvpRoleConfigCol.deleteOne({ _id: 'current_config' });
+    },
   };
   return { db, api: mongoApi, dbType: 'mongo' };
 }
@@ -897,25 +1036,64 @@ client.on('interactionCreate', async interaction => {
 
         let newRsvpStatus = type;
         let replyMessage = '';
+        let roleAssignedMessage = ''; // For RSVP role assignment status
 
-        if (type === 'cantgo') {
-          newRsvpStatus = 'cancelled_rsvp'; // Or simply remove their RSVP if they had one
-          await linkStore.addRsvp(eventId, userId, newRsvpStatus); // This will update counts
+        if (rsvpStatusType === 'cantgo') { // Use rsvpStatusType consistently
+          newRsvpStatus = 'cancelled_rsvp';
+          await linkStore.addRsvp(eventId, userId, newRsvpStatus);
           replyMessage = `You've indicated you can't go to **${event.title}**. Your RSVP has been updated.`;
-        } else {
+
+          // Attempt to remove RSVP role if they previously were 'going'
+          const rsvpRoleConfig = await linkStore.getRsvpRole();
+          if (rsvpRoleConfig && rsvpRoleConfig.role_id && interaction.member) {
+            try {
+              if (interaction.member.roles.cache.has(rsvpRoleConfig.role_id)) {
+                await interaction.member.roles.remove(rsvpRoleConfig.role_id);
+                roleAssignedMessage = `\nThe RSVP role <@&${rsvpRoleConfig.role_id}> has been removed.`;
+              }
+            } catch (roleError) {
+              console.warn(`RSVP Role (cantgo): Failed to remove role ${rsvpRoleConfig.role_id} from ${userId}:`, roleError.message);
+              roleAssignedMessage = `\nThere was an issue removing the RSVP role. Please check bot permissions.`;
+            }
+          }
+
+        } else { // 'going' or 'interested'
+          newRsvpStatus = rsvpStatusType; // Use rsvpStatusType
           // Check capacity for 'going'
-          if (type === 'going' && event.capacity > 0 && event.rsvp_count_going >= event.capacity) {
-            // Check if user is already 'going' - if so, it's fine. If not, they go to waitlist or get 'full' message.
+          if (newRsvpStatus === 'going' && event.capacity > 0 && event.rsvp_count_going >= event.capacity) {
             const existingRsvp = await linkStore.getRsvp(eventId, userId);
             if (!existingRsvp || existingRsvp.rsvp_status !== 'going') {
-                 // For now, just inform it's full. Waitlist is a future enhancement for this step.
                 return interaction.editReply({ content: `Sorry, event **${event.title}** has reached its capacity for 'Going' RSVPs. You can still mark yourself as 'Interested'.` });
             }
           }
 
-          await linkStore.addRsvp(eventId, userId, type); // 'going' or 'interested'
-          replyMessage = `You are now marked as **${type}** for event **${event.title}**!`;
+          await linkStore.addRsvp(eventId, userId, newRsvpStatus);
+          replyMessage = `You are now marked as **${newRsvpStatus}** for event **${event.title}**!`;
+
+          // If 'going', attempt to assign the RSVP role
+          if (newRsvpStatus === 'going') {
+            const rsvpRoleConfig = await linkStore.getRsvpRole();
+            if (rsvpRoleConfig && rsvpRoleConfig.role_id) {
+              if (!interaction.member) {
+                roleAssignedMessage = `\nCould not assign RSVP role as member data is unavailable.`;
+              } else {
+                try {
+                  if (!interaction.member.roles.cache.has(rsvpRoleConfig.role_id)) {
+                    await interaction.member.roles.add(rsvpRoleConfig.role_id);
+                    roleAssignedMessage = `\nYou have been granted the <@&${rsvpRoleConfig.role_id}> role!`;
+                  } else {
+                    roleAssignedMessage = `\nYou already have the <@&${rsvpRoleConfig.role_id}> role.`;
+                  }
+                } catch (roleError) {
+                  console.error(`RSVP Role: Failed to assign role ${rsvpRoleConfig.role_id} to ${userId}:`, roleError.message);
+                  roleAssignedMessage = `\nThere was an issue assigning the RSVP role. Please check bot permissions and role hierarchy.`;
+                }
+              }
+            }
+          }
         }
+
+        replyMessage += roleAssignedMessage; // Append role assignment status
 
         // Optionally, try to update the original event message with new counts if message_id is stored
         if (event.announcement_message_id && event.announcement_channel_id) {
@@ -982,11 +1160,81 @@ client.on('interactionCreate', async interaction => {
     } else if (prefix === 'manage' && action === 'event' && customIdParts[2] === 'rewards' && customIdParts[3]) {
         // manage-event-rewards-<eventId>
         const eventId = customIdParts[3]; // Event ID is now a string
-        await interaction.deferUpdate(); // Defer update before showing modal
-        const { ModalBuilder, TextInputBuilder, ActionRowBuilder } = require('discord.js');
+        await interaction.deferUpdate(); // Defer update before showing modal/options
+        const { ModalBuilder, TextInputBuilder, ActionRowBuilder, StringSelectMenuBuilder, EmbedBuilder, ButtonStyle } = require('discord.js');
+
+        // Fetch existing rewards for context if needed, or just show management options
+        const eventBeingManaged = await linkStore.getEventById(eventId);
+        if (!eventBeingManaged) {
+            return interaction.editReply({ content: 'Could not find the event to manage rewards for.', components: [] });
+        }
+
+        const manageRewardsEmbed = new EmbedBuilder()
+            .setColor(0x00BCD4)
+            .setTitle(`🎁 Manage Rewards for: ${eventBeingManaged.title.substring(0, 200)}`)
+            .setDescription('Add a new custom reward, or add from a predefined global reward type.')
+            .setTimestamp();
+
+        const actionRow = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`add_custom_event_reward_btn-${eventId}`) // New custom ID for clarity
+                    .setLabel('Add New Custom Reward')
+                    .setStyle(ButtonStyle.Success)
+                    .setEmoji('➕'),
+                new ButtonBuilder()
+                    .setCustomId(`add_predefined_event_reward_btn-${eventId}`)
+                    .setLabel('Add From Predefined')
+                    .setStyle(ButtonStyle.Primary)
+                    .setEmoji('📚')
+            );
+        // TODO: Add a button to "View/Remove Existing Event Rewards" later if needed.
+
+        await interaction.editReply({ embeds: [manageRewardsEmbed], components: [actionRow], ephemeral: true });
+
+    } else if (interaction.customId.startsWith('add_predefined_event_reward_btn-')) {
+        const eventId = interaction.customId.split('-')[1];
+        await interaction.deferUpdate(); // Acknowledge this button click before replying
+        const { StringSelectMenuBuilder, StringSelectMenuOptionBuilder, ActionRowBuilder, EmbedBuilder } = require('discord.js');
+
+        try {
+            const globalRewards = await linkStore.getAllGlobalRewardTypes();
+            if (!globalRewards || globalRewards.length === 0) {
+                return interaction.editReply({ content: 'There are no predefined global reward types available to add. Please create some first via the `/manage` command.', components: [], ephemeral: true });
+            }
+
+            const options = globalRewards.slice(0, 25).map(gr => // Max 25 options for select menu
+                new StringSelectMenuOptionBuilder()
+                    .setLabel(gr.name.substring(0, 100))
+                    .setDescription((gr.description || 'No description').substring(0, 100))
+                    .setValue(`gr-${gr.reward_type_id}`) // Prefix with gr- to identify it as global reward selection
+            );
+
+            const selectMenu = new StringSelectMenuBuilder()
+                .setCustomId(`select-global-reward-${eventId}`) // eventId is for context of which event to add to
+                .setPlaceholder('Select a predefined reward type...')
+                .addOptions(options);
+
+            const selectEmbed = new EmbedBuilder()
+                .setColor(0x00BCD4)
+                .setTitle('📚 Add Predefined Reward')
+                .setDescription(`Select a global reward type from the list below to add it as a new reward to event #${eventId}.`)
+                .setFooter({text: globalRewards.length > 25 ? 'Showing first 25 predefined types.' : '' });
+
+            await interaction.editReply({ embeds: [selectEmbed], components: [new ActionRowBuilder().addComponents(selectMenu)], ephemeral: true });
+
+        } catch (error) {
+            console.error(`Error fetching global reward types for event ${eventId}:`, error);
+            await interaction.editReply({ content: 'An error occurred while fetching predefined reward types.', components: [], ephemeral: true });
+        }
+
+    } else if (interaction.customId.startsWith('add_custom_event_reward_btn-')) {
+        // This is the old 'manage-event-rewards-<eventId>' logic, now more specific
+        const eventId = interaction.customId.split('-')[1];
+        const { ModalBuilder, TextInputBuilder, ActionRowBuilder } = require('discord.js'); // Keep for this specific path
         const modal = new ModalBuilder()
-            .setCustomId(`eventRewardAddModal-${eventId}`)
-            .setTitle(`Add Reward for Event #${eventId}`);
+            .setCustomId(`eventRewardAddModal-${eventId}`) // Existing modal custom ID
+            .setTitle(`Add Custom Reward to Event #${eventId}`);
         const nameInput = new TextInputBuilder().setCustomId('rewardName').setLabel("Reward Name").setStyle(1).setRequired(true);
         const descriptionInput = new TextInputBuilder().setCustomId('rewardDescription').setLabel("Description (Optional)").setStyle(2).setRequired(false);
         const imageUrlInput = new TextInputBuilder().setCustomId('rewardImageUrl').setLabel("Image URL (Optional, for icon)").setStyle(1).setRequired(false);
@@ -1006,8 +1254,602 @@ client.on('interactionCreate', async interaction => {
         await interaction.editReply({ content: `Finished adding rewards for Event #${eventId}.`, components: [] });
     }
     // Other button interactions can be handled here
+    else if (interaction.customId === 'manage_bot_moderators') {
+      await interaction.reply({
+        content: 'To manage bot moderators, please use the following commands:\n' +
+                 '`/managemod add user:<user>`\n' +
+                 '`/managemod remove user:<user>`\n' +
+                 '`/managemod list`',
+        ephemeral: true,
+      });
+    } else if (interaction.customId === 'manage_event_reward_types') {
+      // Handler for "Manage Event Reward Types" button from /manage command
+      const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+      const rewardTypesEmbed = new EmbedBuilder()
+        .setColor(0x5865F2) // Discord Blurple
+        .setTitle('🎁 Manage Global Event Reward Types')
+        .setDescription('Create, view, edit, or delete global reward types that can be used as templates for events.')
+        .setTimestamp();
+
+      const row = new ActionRowBuilder()
+        .addComponents(
+          new ButtonBuilder()
+            .setCustomId('create_global_reward_type_btn')
+            .setLabel('Create New Reward Type')
+            .setStyle(ButtonStyle.Success)
+            .setEmoji('➕'),
+          new ButtonBuilder()
+            .setCustomId('list_global_reward_types_btn')
+            .setLabel('List Reward Types')
+            .setStyle(ButtonStyle.Primary)
+            .setEmoji('📋')
+        );
+      // This interaction is a button click from the /manage command, which was ephemeral.
+      // So, this reply should also be ephemeral.
+      await interaction.reply({ embeds: [rewardTypesEmbed], components: [row], ephemeral: true });
+
+    } else if (interaction.customId === 'create_global_reward_type_btn') {
+      // Handler for "Create New Reward Type" button
+      const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+      const modal = new ModalBuilder()
+        .setCustomId('createGlobalRewardTypeModal')
+        .setTitle('Create New Global Reward Type');
+
+      const nameInput = new TextInputBuilder()
+        .setCustomId('rewardTypeNameInput')
+        .setLabel("Reward Type Name (Unique)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(100);
+
+      const descriptionInput = new TextInputBuilder()
+        .setCustomId('rewardTypeDescriptionInput')
+        .setLabel("Description (Optional)")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(false)
+        .setMaxLength(500);
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(nameInput),
+        new ActionRowBuilder().addComponents(descriptionInput)
+      );
+      await interaction.showModal(modal);
+
+    } else if (interaction.customId === 'list_global_reward_types_btn') {
+      // Handler for "List Reward Types" button
+      await interaction.deferReply({ ephemeral: true });
+      const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, TextInputStyle, ModalBuilder, TextInputBuilder: TextInputBuilderList } = require('discord.js'); // Added ModalBuilder, TextInputBuilder for this scope
+      try {
+        const rewardTypes = await linkStore.getAllGlobalRewardTypes();
+        const listEmbed = new EmbedBuilder()
+          .setColor(0x00BCD4) // INFO_COLOR
+          .setTitle('📋 Global Event Reward Types');
+
+        if (!rewardTypes || rewardTypes.length === 0) {
+          listEmbed.setDescription('No global reward types have been created yet. Use the "Create New Reward Type" button to add one.');
+          await interaction.editReply({ embeds: [listEmbed], ephemeral: true });
+        } else {
+          listEmbed.setDescription('Here are the currently configured global reward types:');
+
+          const components = [];
+          let currentActionRow = new ActionRowBuilder();
+          const maxFields = 25; // Embed field limit
+          const maxButtonsTotal = 25; // Max 5 rows * 5 buttons per row
+          let buttonsAdded = 0;
+
+          for (let i = 0; i < rewardTypes.length; i++) {
+            const rt = rewardTypes[i];
+            if (i < maxFields) {
+                 listEmbed.addFields({
+                    name: rt.name,
+                    value: `ID: \`${rt.reward_type_id}\`\nDesc: ${rt.description || '_No description_'}\nCreated by <@${rt.creator_discord_id}> on <t:${rt.created_at}:D>`,
+                    inline: false
+                });
+            }
+
+            // Add Edit and Delete buttons
+            if (components.length < 5 && currentActionRow.components.length < 5 && buttonsAdded < maxButtonsTotal) {
+                 currentActionRow.addComponents(
+                    new ButtonBuilder()
+                        .setCustomId(`edit-reward-type-${rt.reward_type_id}`)
+                        .setLabel(`Edit: ${rt.name.substring(0, 20)}`)
+                        .setStyle(ButtonStyle.Secondary)
+                        .setEmoji('✏️')
+                );
+                buttonsAdded++;
+            }
+            if (components.length < 5 && currentActionRow.components.length < 5 && buttonsAdded < maxButtonsTotal) {
+                 currentActionRow.addComponents(
+                    new ButtonBuilder()
+                        .setCustomId(`delete-reward-type-${rt.reward_type_id}`)
+                        .setLabel(`Del: ${rt.name.substring(0, 20)}`)
+                        .setStyle(ButtonStyle.Danger)
+                        .setEmoji('🗑️')
+                );
+                buttonsAdded++;
+            }
+
+            if (currentActionRow.components.length > 0 && (currentActionRow.components.length >= 5 || i === rewardTypes.length - 1 || buttonsAdded >= maxButtonsTotal)) {
+                 if(components.length < 5) components.push(currentActionRow);
+                 currentActionRow = new ActionRowBuilder();
+                 if (buttonsAdded >= maxButtonsTotal && i < rewardTypes.length -1) {
+                    listEmbed.setFooter({text: `Displaying buttons for the first ${i+1} types due to Discord limits.`});
+                    break;
+                 }
+            }
+          }
+
+          if (rewardTypes.length > maxFields) {
+            const currentFooter = listEmbed.data.footer?.text || "";
+            listEmbed.setFooter({ text: `Showing details for ${maxFields} of ${rewardTypes.length} types. ${currentFooter}`.trim() });
+          }
+          await interaction.editReply({ embeds: [listEmbed], components: components, ephemeral: true });
+        }
+      } catch (error) {
+        console.error('Error listing global reward types:', error);
+        await interaction.editReply({ content: 'An error occurred while fetching the reward types.', ephemeral: true });
+      }
+    } else if (interaction.customId.startsWith('edit-reward-type-')) {
+        const rewardTypeId = interaction.customId.replace('edit-reward-type-', '');
+        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+        try {
+            const rewardType = await linkStore.getGlobalRewardTypeById(rewardTypeId);
+            if (!rewardType) {
+                return interaction.reply({ content: 'This reward type could not be found. It might have been deleted.', ephemeral: true });
+            }
+
+            const modal = new ModalBuilder()
+                .setCustomId(`editGlobalRewardTypeModal-${rewardTypeId}`)
+                .setTitle(`Edit Reward Type: ${rewardType.name.substring(0, 30)}`);
+
+            const nameInput = new TextInputBuilder()
+                .setCustomId('rewardTypeNameInput')
+                .setLabel("Reward Type Name (Unique)")
+                .setStyle(TextInputStyle.Short)
+                .setRequired(true)
+                .setValue(rewardType.name)
+                .setMaxLength(100);
+
+            const descriptionInput = new TextInputBuilder()
+                .setCustomId('rewardTypeDescriptionInput')
+                .setLabel("Description (Optional)")
+                .setStyle(TextInputStyle.Paragraph)
+                .setRequired(false)
+                .setValue(rewardType.description || '')
+                .setMaxLength(500);
+
+            modal.addComponents(
+                new ActionRowBuilder().addComponents(nameInput),
+                new ActionRowBuilder().addComponents(descriptionInput)
+            );
+            await interaction.showModal(modal);
+
+        } catch (error) {
+            console.error(`Error fetching reward type ${rewardTypeId} for edit:`, error);
+            await interaction.reply({ content: 'An error occurred while preparing to edit this reward type.', ephemeral: true });
+        }
+    } else if (interaction.customId.startsWith('delete-reward-type-')) {
+        const rewardTypeId = interaction.customId.replace('delete-reward-type-', '');
+        const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+        try {
+            const rewardType = await linkStore.getGlobalRewardTypeById(rewardTypeId);
+            if (!rewardType) {
+                return interaction.reply({ content: 'This reward type could not be found. It might have already been deleted.', ephemeral: true });
+            }
+
+            const confirmEmbed = new EmbedBuilder()
+                .setColor(0xFFC107) // WARN_COLOR
+                .setTitle('🗑️ Confirm Deletion')
+                .setDescription(`Are you sure you want to delete the global reward type: **${rewardType.name}** (ID: \`${rewardTypeId}\`)?\nThis action cannot be undone.`)
+                .setTimestamp();
+
+            const row = new ActionRowBuilder()
+                .addComponents(
+                    new ButtonBuilder()
+                        .setCustomId(`confirm-delete-reward-type-${rewardTypeId}`)
+                        .setLabel('Confirm Delete')
+                        .setStyle(ButtonStyle.Danger),
+                    new ButtonBuilder()
+                        .setCustomId('cancel-delete-reward-type')
+                        .setLabel('Cancel')
+                        .setStyle(ButtonStyle.Secondary)
+                );
+            await interaction.reply({ embeds: [confirmEmbed], components: [row], ephemeral: true });
+        } catch (error) {
+            console.error(`Error fetching reward type ${rewardTypeId} for delete confirmation:`, error);
+            await interaction.reply({ content: 'An error occurred while trying to delete this reward type.', ephemeral: true });
+        }
+    } else if (interaction.customId.startsWith('confirm-delete-reward-type-')) {
+        const rewardTypeId = interaction.customId.replace('confirm-delete-reward-type-', '');
+        await interaction.deferUpdate(); // Acknowledge button click, will edit message later
+        try {
+            await linkStore.deleteGlobalRewardType(rewardTypeId);
+            await interaction.editReply({ content: `Global reward type (ID: \`${rewardTypeId}\`) has been deleted successfully.`, embeds: [], components: [], ephemeral: true });
+        } catch (error) {
+            console.error(`Error deleting reward type ${rewardTypeId}:`, error);
+            await interaction.editReply({ content: 'An error occurred while deleting the reward type.', embeds: [], components: [], ephemeral: true });
+        }
+    } else if (interaction.customId === 'cancel-delete-reward-type') {
+        await interaction.deferUpdate();
+        await interaction.editReply({ content: 'Deletion cancelled.', embeds: [], components: [], ephemeral: true });
+    } else if (interaction.customId === 'manage_rsvp_role') {
+        // Handler for "Manage RSVP Role" button from /manage command
+        await interaction.deferReply({ ephemeral: true });
+        const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+        try {
+            const currentRoleConfig = await linkStore.getRsvpRole();
+            const rsvpRoleEmbed = new EmbedBuilder()
+                .setColor(0x00BCD4) // INFO_COLOR
+                .setTitle('🎟️ Manage RSVP Role Configuration')
+                .setTimestamp();
+
+            if (currentRoleConfig && currentRoleConfig.role_id) {
+                rsvpRoleEmbed.setDescription(`The current role assigned upon RSVPing "Going" is: <@&${currentRoleConfig.role_id}> (\`${currentRoleConfig.role_id}\`).\nSet by <@${currentRoleConfig.set_by_user_id}> on <t:${currentRoleConfig.set_at}:F>.`);
+            } else {
+                rsvpRoleEmbed.setDescription('No RSVP role is currently configured. Users will not receive a special role upon RSVPing.');
+            }
+
+            const actionRow = new ActionRowBuilder()
+                .addComponents(
+                    new ButtonBuilder()
+                        .setCustomId('set_change_rsvp_role_btn')
+                        .setLabel(currentRoleConfig && currentRoleConfig.role_id ? 'Change RSVP Role' : 'Set RSVP Role')
+                        .setStyle(ButtonStyle.Primary),
+                    new ButtonBuilder()
+                        .setCustomId('clear_rsvp_role_btn')
+                        .setLabel('Clear RSVP Role')
+                        .setStyle(ButtonStyle.Danger)
+                        .setDisabled(!(currentRoleConfig && currentRoleConfig.role_id)) // Disable if no role is set
+                );
+            await interaction.editReply({ embeds: [rsvpRoleEmbed], components: [actionRow], ephemeral: true });
+        } catch (error) {
+            console.error('Error fetching RSVP role config:', error);
+            await interaction.editReply({ content: 'An error occurred while fetching the RSVP role configuration.', ephemeral: true });
+        }
+    } else if (interaction.customId === 'set_change_rsvp_role_btn') {
+        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+        const modal = new ModalBuilder()
+            .setCustomId('setRsvpRoleModal')
+            .setTitle('Set/Change RSVP Role');
+
+        const roleIdInput = new TextInputBuilder()
+            .setCustomId('rsvpRoleIdInput')
+            .setLabel("Enter Role ID to assign on RSVP")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setPlaceholder('e.g., 123456789012345678');
+            // Consider adding a note about bot permissions to assign the role.
+
+        modal.addComponents(new ActionRowBuilder().addComponents(roleIdInput));
+        await interaction.showModal(modal);
+
+    } else if (interaction.customId === 'clear_rsvp_role_btn') {
+        const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+        const confirmEmbed = new EmbedBuilder()
+            .setColor(0xFFC107) // WARN_COLOR
+            .setTitle('🗑️ Confirm Clear RSVP Role')
+            .setDescription('Are you sure you want to clear the RSVP role configuration? Users will no longer receive a special role upon RSVPing.')
+            .setTimestamp();
+        const row = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId('confirm_clear_rsvp_role_btn')
+                    .setLabel('Confirm Clear')
+                    .setStyle(ButtonStyle.Danger),
+                new ButtonBuilder()
+                    .setCustomId('cancel_clear_rsvp_role_btn')
+                    .setLabel('Cancel')
+                    .setStyle(ButtonStyle.Secondary)
+            );
+        await interaction.reply({ embeds: [confirmEmbed], components: [row], ephemeral: true });
+
+    } else if (interaction.customId === 'confirm_clear_rsvp_role_btn') {
+        await interaction.deferUpdate();
+        try {
+            await linkStore.clearRsvpRole();
+            await interaction.editReply({ content: 'RSVP role configuration has been cleared successfully.', embeds: [], components: [], ephemeral: true });
+        } catch (error) {
+            console.error('Error clearing RSVP role:', error);
+            await interaction.editReply({ content: 'An error occurred while clearing the RSVP role configuration.', embeds: [], components: [], ephemeral: true });
+        }
+    } else if (interaction.customId === 'cancel_clear_rsvp_role_btn') {
+        await interaction.deferUpdate();
+        await interaction.editReply({ content: 'Clearing RSVP role cancelled.', embeds: [], components: [], ephemeral: true });
+    }
+  } else if (interaction.isModalSubmit()) {
+    if (interaction.customId === 'setRsvpRoleModal') {
+        await interaction.deferReply({ ephemeral: true });
+        const roleId = interaction.fields.getTextInputValue('rsvpRoleIdInput');
+        const { EmbedBuilder } = require('discord.js');
+
+        if (!/^\d+$/.test(roleId)) {
+            return interaction.editReply({ content: 'Invalid Role ID format. Please provide a numeric Role ID.', ephemeral: true });
+        }
+
+        // Optional: Validate if the role exists on the server (requires fetching the role)
+        // For now, we'll assume the admin provides a correct ID.
+        // const guild = interaction.guild;
+        // const role = guild?.roles.cache.get(roleId);
+        // if (!role) {
+        //     return interaction.editReply({ content: `Role with ID ${roleId} not found in this server.`, ephemeral: true });
+        // }
+
+        try {
+            await linkStore.setRsvpRole(roleId, interaction.user.id);
+            const successEmbed = new EmbedBuilder()
+                .setColor(0x4CAF50)
+                .setTitle('✅ RSVP Role Set')
+                .setDescription(`The RSVP role has been set to <@&${roleId}> (\`${roleId}\`). Users who RSVP "Going" will now receive this role.`)
+                .setFooter({text: "Ensure the bot has permissions to manage this role."})
+                .setTimestamp();
+            await interaction.editReply({ embeds: [successEmbed], ephemeral: true });
+        } catch (error) {
+            console.error('Error setting RSVP role:', error);
+            await interaction.editReply({ content: 'An error occurred while setting the RSVP role.', ephemeral: true });
+        }
+    } else if (interaction.customId.startsWith('editGlobalRewardTypeModal-')) {
+        const rewardTypeId = interaction.customId.replace('editGlobalRewardTypeModal-', '');
+        await interaction.deferReply({ ephemeral: true });
+        const name = interaction.fields.getTextInputValue('rewardTypeNameInput');
+        const description = interaction.fields.getTextInputValue('rewardTypeDescriptionInput');
+        const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+
+        try {
+            // Check for name conflict only if the name has changed
+            const originalType = await linkStore.getGlobalRewardTypeById(rewardTypeId);
+            if (originalType && originalType.name !== name) {
+                const existingByName = await linkStore.getGlobalRewardTypeByName(name);
+                if (existingByName) {
+                    return interaction.editReply({ content: `Another global reward type with the name "${name}" already exists. Please choose a unique name.`, ephemeral: true });
+                }
+            }
+
+            await linkStore.updateGlobalRewardType(rewardTypeId, name, description);
+
+            const successEmbed = new EmbedBuilder()
+                .setColor(0x4CAF50) // SUCCESS_COLOR
+                .setTitle('✅ Reward Type Updated')
+                .setDescription(`Global reward type "**${name}**" (ID: \`${rewardTypeId}\`) updated successfully!`)
+                .setTimestamp();
+
+            const actionRow = new ActionRowBuilder()
+                .addComponents(
+                     new ButtonBuilder()
+                        .setCustomId('list_global_reward_types_btn')
+                        .setLabel('View All Reward Types')
+                        .setStyle(ButtonStyle.Primary)
+                );
+            await interaction.editReply({ embeds: [successEmbed], components: [actionRow], ephemeral: true });
+
+        } catch (error) {
+            console.error(`Error updating global reward type ${rewardTypeId}:`, error);
+            let errorMessage = 'An error occurred while updating the reward type.';
+             if (error.message && error.message.includes('UNIQUE constraint failed')) {
+                errorMessage = `Another global reward type with the name "${name}" already exists or another unique constraint was violated.`;
+            } else if (error.code === 11000) { // MongoDB duplicate key
+                errorMessage = `Another global reward type with the name "${name}" already exists or another unique constraint was violated (MongoDB).`;
+            }
+            await interaction.editReply({ content: errorMessage, ephemeral: true });
+        }
+    } else if (interaction.customId === 'createGlobalRewardTypeModal') {
+      await interaction.deferReply({ ephemeral: true });
+      const name = interaction.fields.getTextInputValue('rewardTypeNameInput');
+      const description = interaction.fields.getTextInputValue('rewardTypeDescriptionInput');
+      const { generateRewardTypeId } = require('./utils/idGenerator');
+      const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+
+      try {
+        const existing = await linkStore.getGlobalRewardTypeByName(name);
+        if (existing) {
+          return interaction.editReply({ content: `A global reward type with the name "${name}" already exists. Please choose a unique name.`, ephemeral: true });
+        }
+
+        const rewardTypeId = generateRewardTypeId();
+        await linkStore.createGlobalRewardType(rewardTypeId, name, description, interaction.user.id);
+
+        const successEmbed = new EmbedBuilder()
+            .setColor(0x4CAF50) // SUCCESS_COLOR
+            .setTitle('✅ Reward Type Created')
+            .setDescription(`Global reward type "**${name}**" (ID: \`${rewardTypeId}\`) created successfully!`)
+            .setTimestamp();
+
+        const actionRow = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId('list_global_reward_types_btn')
+                    .setLabel('View All Reward Types')
+                    .setStyle(ButtonStyle.Primary),
+                new ButtonBuilder()
+                    .setCustomId('create_global_reward_type_btn')
+                    .setLabel('Create Another')
+                    .setStyle(ButtonStyle.Success)
+            );
+
+        await interaction.editReply({ embeds: [successEmbed], components: [actionRow], ephemeral: true });
+      } catch (error) {
+        console.error('Error creating global reward type:', error);
+        let errorMessage = 'An error occurred while creating the reward type.';
+        if (error.message && error.message.includes('UNIQUE constraint failed')) {
+            errorMessage = `A global reward type with the name "${name}" already exists or another unique constraint was violated.`;
+        } else if (error.code === 11000) { // MongoDB duplicate key
+            errorMessage = `A global reward type with the name "${name}" already exists or another unique constraint was violated (MongoDB).`;
+        }
+        await interaction.editReply({ content: errorMessage, ephemeral: true });
+      }
+    } else if (interaction.customId === 'eventCreateModal') {
+      try {
+      // Defer reply immediately for modal submission
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+      const title = interaction.fields.getTextInputValue('eventTitle');
+      const description = interaction.fields.getTextInputValue('eventDescription');
+      const dateStr = interaction.fields.getTextInputValue('eventDate');
+      const timeStr = interaction.fields.getTextInputValue('eventTime');
+      let imageMainUrl = interaction.fields.getTextInputValue('eventImageMainUrl') || null; // From modal
+
+      // Check if there was a pre-uploaded image or template data from the command
+      const pendingData = client.pendingEventCreations.get(interaction.user.id);
+      if (pendingData && pendingData.attachmentUrl) {
+        imageMainUrl = pendingData.attachmentUrl; // Prioritize uploaded image
+      }
+
+      let island_name = null;
+      let area_name = null;
+      let capacity = 0;
+
+      if (pendingData && pendingData.templateIsland) island_name = pendingData.templateIsland;
+      if (pendingData && pendingData.templateArea) area_name = pendingData.templateArea;
+      if (pendingData && pendingData.templateCapacity) capacity = parseInt(pendingData.templateCapacity, 10) || 0;
+
+      // TODO: Add island/area selection UI logic. For now, using template or null.
+      // This would typically involve another interaction step (select menu) after modal.
+
+      // Validate date and time (basic)
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr) || !/^\d{2}:\d{2}$/.test(timeStr)) {
+        return interaction.followUp({ content: 'Invalid date or time format. Please use YYYY-MM-DD and HH:MM (UTC).', ephemeral: true });
+      }
+      const start_at = Math.floor(new Date(`${dateStr}T${timeStr}:00.000Z`).getTime() / 1000); // Assume UTC
+      const now = Math.floor(Date.now() / 1000);
+
+      const eventData = {
+        title,
+        description,
+        creator_discord_id: interaction.user.id,
+        status: 'draft',
+        created_at: now,
+        updated_at: now,
+        start_at,
+        island_name,
+        area_name,
+        image_main_url: imageMainUrl,
+        capacity: capacity,
+      };
+
+      const eventId = await linkStore.createEvent(eventData);
+      const successEmbed = new EmbedBuilder()
+        .setColor(0x4CAF50) // SUCCESS_COLOR
+        .setTitle('🎉 Event Draft Created!')
+        .setDescription(`Your event draft "**${title}**" has been created with ID #${eventId}.`)
+        .setTimestamp();
+
+      const components = [];
+      const { ISLAND_DATA } = require('./utils/gameData.js'); // Ensure ISLAND_DATA is available
+
+      // Determine next step: Location selection or just custom fields/rewards
+      if (!island_name) { // Island not set by template, ask user
+        successEmbed.addFields({ name: 'Next Step: Location', value: 'Please select the island for your event below.'});
+        const islandOptions = Object.keys(ISLAND_DATA).map(key => ({
+            label: `${ISLAND_DATA[key].emoji} ${key}`,
+            value: key,
+        }));
+        const islandSelectMenu = new StringSelectMenuBuilder()
+            .setCustomId(`select-island-${eventId}`)
+            .setPlaceholder('Select an island...')
+            .addOptions(islandOptions);
+        components.push(new ActionRowBuilder().addComponents(islandSelectMenu));
+      } else if (!area_name) { // Island set by template, but area is not
+        successEmbed.addFields({ name: 'Next Step: Area', value: `Island "**${island_name}**" set from template. Please select the area below.`});
+        const areas = ISLAND_DATA[island_name]?.areas || [];
+        if (areas.length > 0) {
+            const areaOptions = areas.map(area => ({ label: area, value: area }));
+            const areaSelectMenu = new StringSelectMenuBuilder()
+                .setCustomId(`select-area-${eventId}-${island_name}`) // Include island_name for context
+                .setPlaceholder('Select an area...')
+                .addOptions(areaOptions);
+            components.push(new ActionRowBuilder().addComponents(areaSelectMenu));
+        } else {
+             successEmbed.addFields({ name: 'Location Note', value: `Island "**${island_name}**" set. No specific areas defined for this island, or an issue occurred.`});
+        }
+      } else { // Both island and area were set by template
+         successEmbed.addFields({ name: 'Location Set', value: `Location **${island_name} - ${area_name}** set from template.`});
+      }
+
+      // Always add manage custom fields/rewards buttons if location part is done or was pre-filled
+      if (island_name && area_name) { // Or if no location step was needed
+        successEmbed.addFields({ name: 'Further Setup', value: `You can now publish the event or manage custom fields/rewards.` });
+      }
+
+      // Add buttons for custom fields and rewards
+      const manageButtonsRow = new ActionRowBuilder()
+        .addComponents(
+            new ButtonBuilder().setCustomId(`manage-custom-fields-${eventId}`).setLabel('Manage Custom Fields').setStyle(2),
+            new ButtonBuilder().setCustomId(`manage-event-rewards-${eventId}`).setLabel('Manage Rewards').setStyle(2)
+        );
+      components.push(manageButtonsRow);
+
+
+      await interaction.editReply({ embeds: [successEmbed], components: components }); // Ephemeral flag is inherited from deferReply
+
+      if (pendingData) {
+        client.pendingEventCreations.delete(interaction.user.id); // Clean up
+      }
+
+    } catch (modalError) {
+      console.error('Error processing eventCreateModal:', modalError);
+      // Ensure reply if not already done
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: 'There was an error creating your event draft. Please try again.', flags: MessageFlags.Ephemeral }).catch(()=>{});
+      } else {
+        await interaction.followUp({ content: 'There was an error creating your event draft. Please try again.', flags: MessageFlags.Ephemeral }).catch(()=>{});
+      }
+    }
+   } else if (interaction.customId.startsWith('customFieldAddModal-')) {
+      try {
+        const eventId = interaction.customId.split('-')[1]; // Event ID is now a string
+        const fieldName = interaction.fields.getTextInputValue('customFieldName');
+        const fieldValue = interaction.fields.getTextInputValue('customFieldValue');
+        const displayOrderStr = interaction.fields.getTextInputValue('customFieldDisplayOrder');
+        const displayOrder = displayOrderStr ? parseInt(displayOrderStr, 10) : 0;
+
+        if (!fieldName || !fieldValue) {
+          return interaction.reply({ content: 'Field Name and Field Value are required.', flags: MessageFlags.Ephemeral });
+        }
+
+        await linkStore.addEventCustomField(eventId, fieldName, fieldValue, displayOrder || 0);
+
+        const row = new ActionRowBuilder()
+          .addComponents(
+            new ButtonBuilder().setCustomId(`manage-custom-fields-${eventId}`).setLabel('Add Another Field').setStyle(1), // Primary
+            new ButtonBuilder().setCustomId(`custom-field-finish-${eventId}`).setLabel('Finish Adding Fields').setStyle(2) // Secondary
+          );
+
+        return interaction.reply({ content: `Custom field "**${fieldName}**" added. Add another or finish.`, components: [row], flags: MessageFlags.Ephemeral });
+      } catch (customModalError) {
+        console.error('Error processing customFieldAddModal:', customModalError);
+        return interaction.reply({ content: 'Error adding custom field.', flags: MessageFlags.Ephemeral });
+      }
+    } else if (interaction.customId.startsWith('eventRewardAddModal-')) {
+      try {
+        const eventId = interaction.customId.split('-')[1]; // Event ID is now a string
+        const name = interaction.fields.getTextInputValue('rewardName');
+        const description = interaction.fields.getTextInputValue('rewardDescription') || null;
+        const imageUrl = interaction.fields.getTextInputValue('rewardImageUrl') || null;
+        const displayOrderStr = interaction.fields.getTextInputValue('rewardDisplayOrder');
+        const displayOrder = displayOrderStr ? parseInt(displayOrderStr, 10) : 0;
+
+        if (!name) {
+          return interaction.reply({ content: 'Reward Name is required.', flags: MessageFlags.Ephemeral });
+        }
+
+        await linkStore.addEventReward(eventId, name, description, imageUrl, displayOrder || 0);
+
+        const { ButtonBuilder, ActionRowBuilder } = require('discord.js'); // Ensure in scope
+        const row = new ActionRowBuilder()
+          .addComponents(
+            new ButtonBuilder().setCustomId(`manage-event-rewards-${eventId}`).setLabel('Add Another Reward').setStyle(1),
+            new ButtonBuilder().setCustomId(`reward-finish-${eventId}`).setLabel('Finish Adding Rewards').setStyle(2)
+          );
+
+        return interaction.reply({ content: `Reward "**${name}**" added. Add another or finish.`, components: [row], flags: MessageFlags.Ephemeral });
+      } catch (rewardModalError) {
+        console.error('Error processing eventRewardAddModal:', rewardModalError);
+        return interaction.reply({ content: 'Error adding reward.', flags: MessageFlags.Ephemeral });
+      }
+    }
   } else if (interaction.isStringSelectMenu()) {
     const { ISLAND_DATA } = require('./utils/gameData.js'); // Ensure ISLAND_DATA is available
+    const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js'); // For follow-up messages
+
     const customIdParts = interaction.customId.split('-');
     const type = customIdParts[0]; // 'select'
     const entity = customIdParts[1]; // 'island' or 'area'
@@ -1071,6 +1913,49 @@ client.on('interactionCreate', async interaction => {
             console.error(`Error processing area select for event ${eventId}:`, areaSelectError);
             // Avoid further interaction errors if the original interaction is already invalid.
             console.warn(`[INDEX_HANDLER] Could not send user-facing error for area select for event ${eventId} as interaction might be invalid.`);
+        }
+    } else if (customIdParts[0] === 'select' && customIdParts[1] === 'global' && customIdParts[2] === 'reward' && customIdParts[3]) {
+        // customId: select-global-reward-<eventId>
+        const eventId = customIdParts[3];
+        const selectedGlobalRewardId = interaction.values[0].replace('gr-', ''); // Remove prefix
+        await interaction.deferUpdate(); // Acknowledge select menu
+
+        try {
+            const globalReward = await linkStore.getGlobalRewardTypeById(selectedGlobalRewardId);
+            if (!globalReward) {
+                return interaction.editReply({ content: 'The selected predefined reward type could not be found. It might have been deleted.', components: [], ephemeral: true });
+            }
+
+            // Add this global reward as a new event-specific reward
+            // The `addEventReward` function takes: eventId, name, description, imageUrl, displayOrder
+            // We'll copy name and description. ImageUrl and displayOrder can be null/0 or managed later.
+            await linkStore.addEventReward(eventId, globalReward.name, globalReward.description, null, 0);
+
+            const successEmbed = new EmbedBuilder()
+                .setColor(0x4CAF50)
+                .setTitle('✅ Reward Added to Event')
+                .setDescription(`The predefined reward "**${globalReward.name}**" has been added to event #${eventId}.`)
+                .setTimestamp();
+
+            // Buttons to allow adding another or finishing
+            const followupActionRow = new ActionRowBuilder()
+                .addComponents(
+                    new ButtonBuilder()
+                        .setCustomId(`add_predefined_event_reward_btn-${eventId}`) // Go back to select another predefined
+                        .setLabel('Add Another Predefined')
+                        .setStyle(ButtonStyle.Primary),
+                    new ButtonBuilder()
+                        .setCustomId(`add_custom_event_reward_btn-${eventId}`) // Option to add a fully custom one
+                        .setLabel('Add Custom Reward')
+                        .setStyle(ButtonStyle.Success),
+                    // Consider a "Finish Managing Rewards" button that takes them back to the main /events edit options or similar
+                );
+
+            await interaction.editReply({ embeds: [successEmbed], components: [followupActionRow], ephemeral: true });
+
+        } catch (error) {
+            console.error(`Error adding global reward ${selectedGlobalRewardId} to event ${eventId}:`, error);
+            await interaction.editReply({ content: 'An error occurred while adding the predefined reward to the event.', components: [], ephemeral: true });
         }
     } else if (interaction.customId === 'select_event_to_publish') {
       try {

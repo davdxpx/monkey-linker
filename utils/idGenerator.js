@@ -22,6 +22,22 @@ function generateEventId() {
   return result;
 }
 
+/**
+ * Generates a random 8-character string for reward types.
+ * Similar to generateEventId but uses a slightly different length for potential distinction.
+ * @returns {string} An 8-character random alphanumeric ID.
+ */
+function generateRewardTypeId() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  const randomBytes = crypto.randomBytes(8);
+  for (let i = 0; i < 8; i++) {
+    result += chars[randomBytes[i] % chars.length];
+  }
+  return result;
+}
+
 module.exports = {
   generateEventId,
+  generateRewardTypeId,
 };
