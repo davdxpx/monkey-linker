@@ -39,9 +39,16 @@ module.exports = {
           .setCustomId('configure_bot_roles_btn')
           .setLabel('Configure Bot Roles')
           .setStyle(ButtonStyle.Primary)
-          .setEmoji('⚙️') // Changed emoji for general roles
+          .setEmoji('⚙️'), // Changed emoji for general roles
+        new ButtonBuilder()
+          .setCustomId('manual_user_link_btn')
+          .setLabel('Manual User Link')
+          .setStyle(ButtonStyle.Secondary) // Secondary style as it's a specific action
+          .setEmoji('🔗')
       );
 
+    // If more than 3 buttons, consider multiple rows. For 4, one row is fine.
+    // Max 5 buttons per ActionRowBuilder.
     await interaction.reply({ embeds: [manageEmbed], components: [row], ephemeral: true });
   },
 };
