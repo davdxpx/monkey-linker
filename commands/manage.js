@@ -36,10 +36,10 @@ module.exports = {
           .setStyle(ButtonStyle.Primary)
           .setEmoji('🎁'),
         new ButtonBuilder()
-          .setCustomId('manage_rsvp_role')
-          .setLabel('Manage RSVP Role')
+          .setCustomId('configure_bot_roles_btn')
+          .setLabel('Configure Bot Roles')
           .setStyle(ButtonStyle.Primary)
-          .setEmoji('🎟️')
+          .setEmoji('⚙️') // Changed emoji for general roles
       );
 
     await interaction.reply({ embeds: [manageEmbed], components: [row], ephemeral: true });

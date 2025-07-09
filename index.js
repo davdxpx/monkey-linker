@@ -221,14 +221,20 @@ async function initSqlite(DB_PATH = './links.db') {
       );`);
       db.exec(`CREATE INDEX IF NOT EXISTS idx_global_reward_types_name ON global_reward_types(name);`);
 
-      // RSVP Role Configuration Table (Singleton)
-      db.exec(`CREATE TABLE IF NOT EXISTS rsvp_role_config (
-          config_id INTEGER PRIMARY KEY DEFAULT 1, -- Ensures only one row
+      // Drop old RSVP role config table
+      db.exec(`DROP TABLE IF EXISTS rsvp_role_config;`);
+
+      // New Bot Role Configurations Table
+      db.exec(`CREATE TABLE IF NOT EXISTS bot_role_configs (
+          config_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          guild_id TEXT NOT NULL,
+          config_type TEXT NOT NULL, -- e.g., 'VERIFIED_ROLE', 'EVENT_RSVP_ROLE'
           role_id TEXT NOT NULL,
           set_by_user_id TEXT NOT NULL,
           set_at INTEGER NOT NULL,
-          CONSTRAINT rsvp_role_config_singleton CHECK (config_id = 1)
+          UNIQUE(guild_id, config_type)
       );`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_bot_role_configs_guild_type ON bot_role_configs(guild_id, config_type);`);
 
     });
 
@@ -480,20 +486,23 @@ async function initSqlite(DB_PATH = './links.db') {
         return sql.run('DELETE FROM global_reward_types WHERE reward_type_id = ?', [id]);
       },
 
-      // RSVP Role Config Methods (SQLite)
-      setRsvpRole: (roleId, adminUserId) => {
+      // New Bot Role Config Methods (SQLite)
+      setRoleConfig: (guildId, configType, roleId, adminUserId) => {
         const now = Math.floor(Date.now() / 1000);
         return sql.run(
-          `INSERT OR REPLACE INTO rsvp_role_config (config_id, role_id, set_by_user_id, set_at)
-           VALUES (1, ?, ?, ?)`, // config_id is always 1
-          [roleId, adminUserId, now]
+          `INSERT OR REPLACE INTO bot_role_configs (guild_id, config_type, role_id, set_by_user_id, set_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [guildId, configType, roleId, adminUserId, now]
         );
       },
-      getRsvpRole: () => {
-        return sql.get('SELECT role_id, set_by_user_id, set_at FROM rsvp_role_config WHERE config_id = 1');
+      getRoleConfig: (guildId, configType) => {
+        return sql.get('SELECT role_id, set_by_user_id, set_at FROM bot_role_configs WHERE guild_id = ? AND config_type = ?', [guildId, configType]);
       },
-      clearRsvpRole: () => {
-        return sql.run('DELETE FROM rsvp_role_config WHERE config_id = 1');
+      getAllRoleConfigs: (guildId) => {
+        return sql.all('SELECT config_type, role_id, set_by_user_id, set_at FROM bot_role_configs WHERE guild_id = ?', [guildId]);
+      },
+      clearRoleConfig: (guildId, configType) => {
+        return sql.run('DELETE FROM bot_role_configs WHERE guild_id = ? AND config_type = ?', [guildId, configType]);
       },
     };
 
@@ -550,8 +559,11 @@ async function initMongoBackend(cfg) {
   await globalRewardTypesCol.createIndex({ name: 1 }, { unique: true });
   await globalRewardTypesCol.createIndex({ reward_type_id: 1 }, { unique: true });
 
-  const rsvpRoleConfigCol = db.collection('rsvp_role_config');
-  // No specific index needed if we always query by a known _id like "current_config"
+  // Remove old rsvpRoleConfigCol if it was ever created (optional, as it might not exist)
+  // await db.collection('rsvp_role_config').drop().catch(e => { if (e.code !== 26) console.warn("Tried to drop rsvp_role_config, but it didn't exist or another error:", e.message); });
+
+  const botRoleConfigsCol = db.collection('bot_role_configs');
+  await botRoleConfigsCol.createIndex({ guild_id: 1, config_type: 1 }, { unique: true });
 
 
   // Note: The linkStore API will need to be expanded to handle these new collections/tables.
@@ -844,24 +856,27 @@ async function initMongoBackend(cfg) {
       return globalRewardTypesCol.deleteOne({ _id: id });
     },
 
-    // RSVP Role Config Methods (MongoDB)
-    setRsvpRole: (roleId, adminUserId) => {
+    // New Bot Role Config Methods (MongoDB)
+    setRoleConfig: (guildId, configType, roleId, adminUserId) => {
       const now = Math.floor(Date.now() / 1000);
-      return rsvpRoleConfigCol.updateOne(
-        { _id: 'current_config' }, // Use a fixed _id for the singleton document
+      return botRoleConfigsCol.updateOne(
+        { guild_id: guildId, config_type: configType },
         { $set: { role_id: roleId, set_by_user_id: adminUserId, set_at: now } },
         { upsert: true }
       );
     },
-    getRsvpRole: async () => {
-      const config = await rsvpRoleConfigCol.findOne({ _id: 'current_config' });
+    getRoleConfig: async (guildId, configType) => {
+      const config = await botRoleConfigsCol.findOne({ guild_id: guildId, config_type: configType });
       if (config) {
         return { role_id: config.role_id, set_by_user_id: config.set_by_user_id, set_at: config.set_at };
       }
       return null;
     },
-    clearRsvpRole: () => {
-      return rsvpRoleConfigCol.deleteOne({ _id: 'current_config' });
+    getAllRoleConfigs: (guildId) => {
+      return botRoleConfigsCol.find({ guild_id: guildId }).toArray();
+    },
+    clearRoleConfig: (guildId, configType) => {
+      return botRoleConfigsCol.deleteOne({ guild_id: guildId, config_type: configType });
     },
   };
   return { db, api: mongoApi, dbType: 'mongo' };
@@ -1132,16 +1147,16 @@ client.on('interactionCreate', async interaction => {
           replyMessage = `You've indicated you can't go to **${event.title}**. Your RSVP has been updated.`;
 
           // Attempt to remove RSVP role if they previously were 'going'
-          const rsvpRoleConfig = await linkStore.getRsvpRole();
+          const rsvpRoleConfig = await linkStore.getRoleConfig(interaction.guildId, 'EVENT_RSVP_ROLE'); // Updated
           if (rsvpRoleConfig && rsvpRoleConfig.role_id && interaction.member) {
             try {
               if (interaction.member.roles.cache.has(rsvpRoleConfig.role_id)) {
                 await interaction.member.roles.remove(rsvpRoleConfig.role_id);
-                roleAssignedMessage = `\nThe RSVP role <@&${rsvpRoleConfig.role_id}> has been removed.`;
+                roleAssignedMessage = `\nThe Event RSVP role <@&${rsvpRoleConfig.role_id}> has been removed.`; // Clarified message
               }
             } catch (roleError) {
-              console.warn(`RSVP Role (cantgo): Failed to remove role ${rsvpRoleConfig.role_id} from ${userId}:`, roleError.message);
-              roleAssignedMessage = `\nThere was an issue removing the RSVP role. Please check bot permissions.`;
+              console.warn(`Event RSVP Role (cantgo): Failed to remove role ${rsvpRoleConfig.role_id} from ${userId}:`, roleError.message);
+              roleAssignedMessage = `\nThere was an issue removing the Event RSVP role. Please check bot permissions.`; // Clarified message
             }
           }
 
@@ -1160,10 +1175,10 @@ client.on('interactionCreate', async interaction => {
 
           // If 'going', attempt to assign the RSVP role
           if (newRsvpStatus === 'going') {
-            const rsvpRoleConfig = await linkStore.getRsvpRole();
+            const rsvpRoleConfig = await linkStore.getRoleConfig(interaction.guildId, 'EVENT_RSVP_ROLE'); // Updated
             if (rsvpRoleConfig && rsvpRoleConfig.role_id) {
               if (!interaction.member) {
-                roleAssignedMessage = `\nCould not assign RSVP role as member data is unavailable.`;
+                roleAssignedMessage = `\nCould not assign Event RSVP role as member data is unavailable.`; // Clarified message
               } else {
                 try {
                   if (!interaction.member.roles.cache.has(rsvpRoleConfig.role_id)) {
@@ -1425,13 +1440,93 @@ client.on('interactionCreate', async interaction => {
     }
     // Other button interactions can be handled here
     else if (interaction.customId === 'manage_bot_moderators') {
-      await interaction.reply({
-        content: 'To manage bot moderators, please use the following commands:\n' +
-                 '`/managemod add user:<user>`\n' +
-                 '`/managemod remove user:<user>`\n' +
-                 '`/managemod list`',
-        ephemeral: true,
-      });
+      // This now opens a sub-menu for moderator management
+      const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+      const modManageEmbed = new EmbedBuilder()
+        .setColor(0x5865F2) // Discord Blurple
+        .setTitle('🛡️ Manage Bot Moderators')
+        .setDescription('Add, remove, or list users who have bot moderator permissions.')
+        .setTimestamp();
+
+      const row = new ActionRowBuilder()
+        .addComponents(
+          new ButtonBuilder()
+            .setCustomId('add_bot_mod_btn')
+            .setLabel('Add Moderator')
+            .setStyle(ButtonStyle.Success)
+            .setEmoji('➕'),
+          new ButtonBuilder()
+            .setCustomId('remove_bot_mod_btn')
+            .setLabel('Remove Moderator')
+            .setStyle(ButtonStyle.Danger)
+            .setEmoji('➖'),
+          new ButtonBuilder()
+            .setCustomId('list_bot_mods_integrated_btn')
+            .setLabel('List Moderators')
+            .setStyle(ButtonStyle.Primary)
+            .setEmoji('📋')
+        );
+      // This interaction is a button click from the /manage command, which was ephemeral.
+      // So, this reply should also be ephemeral.
+      await interaction.reply({ embeds: [modManageEmbed], components: [row], ephemeral: true });
+
+    } else if (interaction.customId === 'add_bot_mod_btn') {
+        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+        const modal = new ModalBuilder()
+            .setCustomId('addBotModModal')
+            .setTitle('Add Bot Moderator');
+        const userInput = new TextInputBuilder()
+            .setCustomId('botModUserInput')
+            .setLabel("User ID or Mention")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setPlaceholder('e.g., 123456789012345678 or @username');
+        modal.addComponents(new ActionRowBuilder().addComponents(userInput));
+        await interaction.showModal(modal);
+
+    } else if (interaction.customId === 'remove_bot_mod_btn') {
+        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+        const modal = new ModalBuilder()
+            .setCustomId('removeBotModModal')
+            .setTitle('Remove Bot Moderator');
+        const userInput = new TextInputBuilder()
+            .setCustomId('botModUserInput')
+            .setLabel("User ID or Mention of Moderator to Remove")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setPlaceholder('e.g., 123456789012345678 or @username');
+        modal.addComponents(new ActionRowBuilder().addComponents(userInput));
+        await interaction.showModal(modal);
+
+    } else if (interaction.customId === 'list_bot_mods_integrated_btn') {
+        await interaction.deferReply({ ephemeral: true });
+        const { EmbedBuilder } = require('discord.js');
+        try {
+            const moderators = await linkStore.listModerators();
+            const listEmbed = new EmbedBuilder()
+                .setColor(0x00BCD4)
+                .setTitle('📋 Current Bot Moderators');
+
+            if (!moderators || moderators.length === 0) {
+                listEmbed.setDescription('No users are currently designated as bot moderators.');
+            } else {
+                const modUsers = [];
+                for (const mod of moderators) {
+                    try {
+                        const user = await client.users.fetch(mod.user_id);
+                        modUsers.push(`- ${user.tag} (ID: ${mod.user_id})\n  Granted by: <@${mod.granted_by_user_id}> on <t:${mod.granted_at}:D>`);
+                    } catch (fetchError) {
+                        modUsers.push(`- Unknown User (ID: ${mod.user_id})\n  Granted by: <@${mod.granted_by_user_id}> on <t:${mod.granted_at}:D> (Error fetching user)`);
+                        console.warn(`Could not fetch user details for moderator ID ${mod.user_id}:`, fetchError.message);
+                    }
+                }
+                listEmbed.setDescription(modUsers.join('\n').substring(0, 4000));
+            }
+            await interaction.editReply({ embeds: [listEmbed] });
+        } catch (error) {
+            console.error('Error listing moderators (integrated):', error);
+            await interaction.editReply({ content: 'Could not retrieve the list of moderators.' });
+        }
     } else if (interaction.customId === 'manage_event_reward_types') {
       // Handler for "Manage Event Reward Types" button from /manage command
       const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
@@ -1669,122 +1764,220 @@ client.on('interactionCreate', async interaction => {
     } else if (interaction.customId === 'cancel-delete-reward-type') {
         await interaction.deferUpdate();
         await interaction.editReply({ content: 'Deletion cancelled.', embeds: [], components: [], ephemeral: true });
-    } else if (interaction.customId === 'manage_rsvp_role') {
-        // Handler for "Manage RSVP Role" button from /manage command
+    } else if (interaction.customId === 'configure_bot_roles_btn') {
         await interaction.deferReply({ ephemeral: true });
         const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+
+        // Define manageable role types and their display names
+        const manageableRoleTypes = [
+            { type: 'VERIFIED_ROLE', name: 'Verified User Role', description: 'Role assigned after successful Roblox account verification.' },
+            { type: 'EVENT_RSVP_ROLE', name: 'Event RSVP "Going" Role', description: 'Role assigned when a user RSVPs "Going" to an event.' },
+            // Add more role types here as needed, e.g.:
+            // { type: 'BOT_MOD_ROLE', name: 'Bot Moderator Role (Informational)', description: 'A general role for bot mods (actual permissions are DB based).' },
+        ];
+
         try {
-            const currentRoleConfig = await linkStore.getRsvpRole();
-            const rsvpRoleEmbed = new EmbedBuilder()
-                .setColor(0x00BCD4) // INFO_COLOR
-                .setTitle('🎟️ Manage RSVP Role Configuration')
+            const allConfigs = await linkStore.getAllRoleConfigs(interaction.guildId);
+            const configsMap = new Map(allConfigs.map(c => [c.config_type, c]));
+
+            const embed = new EmbedBuilder()
+                .setColor(0x0099FF)
+                .setTitle('⚙️ Configure Bot Roles')
+                .setDescription('Set or change various important roles used by the bot.')
                 .setTimestamp();
 
-            if (currentRoleConfig && currentRoleConfig.role_id) {
-                rsvpRoleEmbed.setDescription(`The current role assigned upon RSVPing "Going" is: <@&${currentRoleConfig.role_id}> (\`${currentRoleConfig.role_id}\`).\nSet by <@${currentRoleConfig.set_by_user_id}> on <t:${currentRoleConfig.set_at}:F>.`);
-            } else {
-                rsvpRoleEmbed.setDescription('No RSVP role is currently configured. Users will not receive a special role upon RSVPing.');
+            const components = [];
+
+            for (const roleType of manageableRoleTypes) {
+                const currentConfig = configsMap.get(roleType.type);
+                let roleInfo = `**${roleType.name}**: ${currentConfig ? `<@&${currentConfig.role_id}> (\`${currentConfig.role_id}\`)` : '_Not Set_'}`;
+                roleInfo += `\n*${roleType.description}*`;
+                embed.addFields({ name: '\u200B', value: roleInfo }); // Using zero-width space for a visual break if needed
+
+                const row = new ActionRowBuilder()
+                    .addComponents(
+                        new ButtonBuilder()
+                            .setCustomId(`set_role_btn-${roleType.type}`)
+                            .setLabel(currentConfig ? 'Change Role' : 'Set Role')
+                            .setStyle(ButtonStyle.Primary)
+                    );
+                if (currentConfig) {
+                    row.addComponents(
+                        new ButtonBuilder()
+                            .setCustomId(`clear_role_btn-${roleType.type}`)
+                            .setLabel('Clear Setting')
+                            .setStyle(ButtonStyle.Danger)
+                    );
+                }
+                components.push(row);
+            }
+            if (components.length === 0) { // Should not happen with predefined manageableRoleTypes
+                embed.addFields({name: "No Configurable Roles", value: "No role types are currently defined for configuration."});
             }
 
-            const actionRow = new ActionRowBuilder()
-                .addComponents(
-                    new ButtonBuilder()
-                        .setCustomId('set_change_rsvp_role_btn')
-                        .setLabel(currentRoleConfig && currentRoleConfig.role_id ? 'Change RSVP Role' : 'Set RSVP Role')
-                        .setStyle(ButtonStyle.Primary),
-                    new ButtonBuilder()
-                        .setCustomId('clear_rsvp_role_btn')
-                        .setLabel('Clear RSVP Role')
-                        .setStyle(ButtonStyle.Danger)
-                        .setDisabled(!(currentRoleConfig && currentRoleConfig.role_id)) // Disable if no role is set
-                );
-            await interaction.editReply({ embeds: [rsvpRoleEmbed], components: [actionRow], ephemeral: true });
+            await interaction.editReply({ embeds: [embed], components: components, ephemeral: true });
+
         } catch (error) {
-            console.error('Error fetching RSVP role config:', error);
-            await interaction.editReply({ content: 'An error occurred while fetching the RSVP role configuration.', ephemeral: true });
+            console.error('Error fetching or displaying role configurations:', error);
+            await interaction.editReply({ content: 'An error occurred while loading role configurations.', ephemeral: true });
         }
-    } else if (interaction.customId === 'set_change_rsvp_role_btn') {
-        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
-        const modal = new ModalBuilder()
-            .setCustomId('setRsvpRoleModal')
-            .setTitle('Set/Change RSVP Role');
 
-        const roleIdInput = new TextInputBuilder()
-            .setCustomId('rsvpRoleIdInput')
-            .setLabel("Enter Role ID to assign on RSVP")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true)
-            .setPlaceholder('e.g., 123456789012345678');
-            // Consider adding a note about bot permissions to assign the role.
+    } else if (interaction.customId.startsWith('set_role_btn-')) {
+        const configType = interaction.customId.split('-')[1];
+        // Defer update because we are sending a new message with a select menu
+        await interaction.deferUpdate({ephemeral: true});
+        const { StringSelectMenuBuilder, StringSelectMenuOptionBuilder, ActionRowBuilder, EmbedBuilder } = require('discord.js');
 
-        modal.addComponents(new ActionRowBuilder().addComponents(roleIdInput));
-        await interaction.showModal(modal);
+        try {
+            const roles = await interaction.guild.roles.fetch();
+            const roleOptions = roles
+                .filter(role => !role.managed && role.id !== interaction.guild.id) // Filter out managed roles and @everyone
+                .map(role => new StringSelectMenuOptionBuilder().setLabel(role.name.substring(0,100)).setValue(role.id))
+                .slice(0, 25); // Max 25 options
 
-    } else if (interaction.customId === 'clear_rsvp_role_btn') {
+            if (roleOptions.length === 0) {
+                return interaction.followUp({ content: 'No suitable roles found in this server to select.', ephemeral: true });
+            }
+
+            // Find display name for configType
+            const manageableRoleTypes = [ // Duplicated here for now, consider moving to a shared const
+                { type: 'VERIFIED_ROLE', name: 'Verified User Role' },
+                { type: 'EVENT_RSVP_ROLE', name: 'Event RSVP "Going" Role' },
+            ];
+            const roleTypeInfo = manageableRoleTypes.find(rt => rt.type === configType);
+            const roleTypeName = roleTypeInfo ? roleTypeInfo.name : configType;
+
+
+            const selectMenu = new StringSelectMenuBuilder()
+                .setCustomId(`select_discord_role_menu-${configType}`)
+                .setPlaceholder(`Select a role for: ${roleTypeName}`)
+                .addOptions(roleOptions);
+
+            const selectEmbed = new EmbedBuilder()
+                .setColor(0x00BCD4)
+                .setTitle(`Select Role for: ${roleTypeName}`)
+                .setDescription(`Please choose a role from the server to be used as the "${roleTypeName}".`);
+
+            // Since original interaction was deferred, use followUp for new message with select menu
+            await interaction.followUp({ embeds: [selectEmbed], components: [new ActionRowBuilder().addComponents(selectMenu)], ephemeral: true });
+
+        } catch (error) {
+            console.error(`Error fetching roles for ${configType}:`, error);
+            await interaction.followUp({ content: `An error occurred while fetching server roles. Ensure the bot has 'View Roles' permission.`, ephemeral: true });
+        }
+    } else if (interaction.customId.startsWith('clear_role_btn-')) {
+        const configType = interaction.customId.split('-')[1];
+        // Confirmation for clearing
         const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
         const confirmEmbed = new EmbedBuilder()
-            .setColor(0xFFC107) // WARN_COLOR
-            .setTitle('🗑️ Confirm Clear RSVP Role')
-            .setDescription('Are you sure you want to clear the RSVP role configuration? Users will no longer receive a special role upon RSVPing.')
+            .setColor(0xFFC107)
+            .setTitle(`🗑️ Confirm Clear Role: ${configType}`)
+            .setDescription(`Are you sure you want to clear the configuration for the "${configType}" role?`)
             .setTimestamp();
-        const row = new ActionRowBuilder()
-            .addComponents(
-                new ButtonBuilder()
-                    .setCustomId('confirm_clear_rsvp_role_btn')
-                    .setLabel('Confirm Clear')
-                    .setStyle(ButtonStyle.Danger),
-                new ButtonBuilder()
-                    .setCustomId('cancel_clear_rsvp_role_btn')
-                    .setLabel('Cancel')
-                    .setStyle(ButtonStyle.Secondary)
-            );
-        await interaction.reply({ embeds: [confirmEmbed], components: [row], ephemeral: true });
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`confirm_clear_role-${configType}`).setLabel('Confirm Clear').setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId('cancel_clear_role').setLabel('Cancel').setStyle(ButtonStyle.Secondary)
+        );
+        await interaction.reply({ embeds: [confirmEmbed], components: [row], ephemeral: true }); // New reply for this confirmation
 
-    } else if (interaction.customId === 'confirm_clear_rsvp_role_btn') {
+    } else if (interaction.customId.startsWith('confirm_clear_role-')) {
+        const configType = interaction.customId.split('-')[1];
         await interaction.deferUpdate();
         try {
-            await linkStore.clearRsvpRole();
-            await interaction.editReply({ content: 'RSVP role configuration has been cleared successfully.', embeds: [], components: [], ephemeral: true });
+            await linkStore.clearRoleConfig(interaction.guildId, configType);
+            // Optionally, resend the configure_bot_roles_btn view or a success message
+            await interaction.editReply({ content: `Configuration for "${configType}" role has been cleared.`, components: [], embeds:[] });
         } catch (error) {
-            console.error('Error clearing RSVP role:', error);
-            await interaction.editReply({ content: 'An error occurred while clearing the RSVP role configuration.', embeds: [], components: [], ephemeral: true });
+            console.error(`Error clearing role config ${configType}:`, error);
+            await interaction.editReply({ content: `An error occurred while clearing the role config.`, components: [], embeds:[] });
         }
-    } else if (interaction.customId === 'cancel_clear_rsvp_role_btn') {
+    } else if (interaction.customId === 'cancel_clear_role') {
         await interaction.deferUpdate();
-        await interaction.editReply({ content: 'Clearing RSVP role cancelled.', embeds: [], components: [], ephemeral: true });
+        await interaction.editReply({ content: 'Clearing role configuration cancelled.', components: [], embeds:[] });
     }
   } else if (interaction.isModalSubmit()) {
-    if (interaction.customId === 'setRsvpRoleModal') {
+    if (interaction.customId === 'addBotModModal') {
         await interaction.deferReply({ ephemeral: true });
-        const roleId = interaction.fields.getTextInputValue('rsvpRoleIdInput');
-        const { EmbedBuilder } = require('discord.js');
+        const userInput = interaction.fields.getTextInputValue('botModUserInput');
+        const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+        let targetUser;
 
-        if (!/^\d+$/.test(roleId)) {
-            return interaction.editReply({ content: 'Invalid Role ID format. Please provide a numeric Role ID.', ephemeral: true });
+        // Resolve user input (ID or mention)
+        const userIdMatch = userInput.match(/^<@!?(\d+)>$/) || userInput.match(/^(\d+)$/);
+        if (userIdMatch) {
+            try {
+                targetUser = await client.users.fetch(userIdMatch[1]);
+            } catch (e) {
+                return interaction.editReply({ content: `Could not find user with ID: ${userIdMatch[1]}. Please provide a valid User ID or mention.`, ephemeral: true });
+            }
+        } else {
+            return interaction.editReply({ content: 'Invalid user input. Please provide a User ID or mention.', ephemeral: true });
         }
 
-        // Optional: Validate if the role exists on the server (requires fetching the role)
-        // For now, we'll assume the admin provides a correct ID.
-        // const guild = interaction.guild;
-        // const role = guild?.roles.cache.get(roleId);
-        // if (!role) {
-        //     return interaction.editReply({ content: `Role with ID ${roleId} not found in this server.`, ephemeral: true });
-        // }
+        if (!targetUser) {
+             return interaction.editReply({ content: 'Could not resolve the user. Please try again with a valid ID or mention.', ephemeral: true });
+        }
+        if (targetUser.bot) {
+            return interaction.editReply({ content: 'Bots cannot be designated as bot moderators.', ephemeral: true });
+        }
 
         try {
-            await linkStore.setRsvpRole(roleId, interaction.user.id);
+            await linkStore.grantModeratorRole(targetUser.id, interaction.user.id);
             const successEmbed = new EmbedBuilder()
                 .setColor(0x4CAF50)
-                .setTitle('✅ RSVP Role Set')
-                .setDescription(`The RSVP role has been set to <@&${roleId}> (\`${roleId}\`). Users who RSVP "Going" will now receive this role.`)
-                .setFooter({text: "Ensure the bot has permissions to manage this role."})
-                .setTimestamp();
-            await interaction.editReply({ embeds: [successEmbed], ephemeral: true });
+                .setTitle('✅ Moderator Added')
+                .setDescription(`${targetUser.tag} (${targetUser.id}) has been granted bot moderator status.`);
+
+            const backButton = new ButtonBuilder().setCustomId('manage_bot_moderators').setLabel('Back to Mod Management').setStyle(ButtonStyle.Primary);
+            await interaction.editReply({ embeds: [successEmbed], components: [new ActionRowBuilder().addComponents(backButton)] });
         } catch (error) {
-            console.error('Error setting RSVP role:', error);
-            await interaction.editReply({ content: 'An error occurred while setting the RSVP role.', ephemeral: true });
+            console.error(`Error granting moderator role to ${targetUser.id} via /manage:`, error);
+            await interaction.editReply({ content: `Could not grant moderator status to ${targetUser.tag}. Please check logs.`});
         }
-    } else if (interaction.customId.startsWith('setEventRewardQuantityModal-')) {
+
+    } else if (interaction.customId === 'removeBotModModal') {
+        await interaction.deferReply({ ephemeral: true });
+        const userInput = interaction.fields.getTextInputValue('botModUserInput');
+        const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+        let targetUser;
+
+        const userIdMatch = userInput.match(/^<@!?(\d+)>$/) || userInput.match(/^(\d+)$/);
+        if (userIdMatch) {
+            try {
+                targetUser = await client.users.fetch(userIdMatch[1]);
+            } catch (e) {
+                return interaction.editReply({ content: `Could not find user with ID: ${userIdMatch[1]}.`, ephemeral: true });
+            }
+        } else {
+            return interaction.editReply({ content: 'Invalid user input. Please provide a User ID or mention.', ephemeral: true });
+        }
+
+        if (!targetUser) {
+             return interaction.editReply({ content: 'Could not resolve the user.', ephemeral: true });
+        }
+
+        try {
+            const isMod = await linkStore.isBotModerator(targetUser.id);
+            if (!isMod) {
+                 return interaction.editReply({ content: `${targetUser.tag} is not currently a bot moderator.`, ephemeral: true });
+            }
+            await linkStore.revokeModeratorRole(targetUser.id);
+            const successEmbed = new EmbedBuilder()
+                .setColor(0x4CAF50) // Or an orange/yellow for removal
+                .setTitle('🗑️ Moderator Removed')
+                .setDescription(`${targetUser.tag} (${targetUser.id}) has had their bot moderator status revoked.`);
+
+            const backButton = new ButtonBuilder().setCustomId('manage_bot_moderators').setLabel('Back to Mod Management').setStyle(ButtonStyle.Primary);
+            await interaction.editReply({ embeds: [successEmbed], components: [new ActionRowBuilder().addComponents(backButton)] });
+        } catch (error) {
+            console.error(`Error revoking moderator role from ${targetUser.id} via /manage:`, error);
+            await interaction.editReply({ content: `Could not revoke moderator status from ${targetUser.tag}. Please check logs.`});
+        }
+
+    // The 'setRsvpRoleModal' handler was here. It has been removed as it's obsolete.
+    // Modals for add/remove bot mod are handled above.
+    // Next modal is editGlobalRewardTypeModal.
+    else if (interaction.customId.startsWith('editGlobalRewardTypeModal-')) {
         // Format: setEventRewardQuantityModal-<eventId>-<globalRewardTypeId>
         const parts = interaction.customId.split('-');
         const eventId = parts[1];
@@ -2198,6 +2391,45 @@ client.on('interactionCreate', async interaction => {
             // Avoid further interaction errors if the original interaction is already invalid.
             console.warn(`[INDEX_HANDLER] Could not send user-facing error for area select for event ${eventId} as interaction might be invalid.`);
         }
+    } else if (interaction.customId.startsWith('select_discord_role_menu-')) {
+        const configType = interaction.customId.split('-')[1];
+        const selectedRoleId = interaction.values[0];
+        await interaction.deferUpdate(); // Acknowledge select menu, will follow up
+
+        try {
+            await linkStore.setRoleConfig(interaction.guildId, configType, selectedRoleId, interaction.user.id);
+
+            // Find display name for configType for the success message
+             const manageableRoleTypes = [
+                { type: 'VERIFIED_ROLE', name: 'Verified User Role' },
+                { type: 'EVENT_RSVP_ROLE', name: 'Event RSVP "Going" Role' },
+            ];
+            const roleTypeInfo = manageableRoleTypes.find(rt => rt.type === configType);
+            const roleTypeName = roleTypeInfo ? roleTypeInfo.name : configType;
+
+            // Success message, possibly with a button to go back to the role config screen
+            const successEmbed = new EmbedBuilder()
+                .setColor(0x4CAF50)
+                .setTitle('✅ Role Configured')
+                .setDescription(`The **${roleTypeName}** has been set to <@&${selectedRoleId}> (\`${selectedRoleId}\`).`)
+                .setFooter({text: "Ensure the bot has permissions to manage this role if applicable."})
+                .setTimestamp();
+
+            const backButton = new ButtonBuilder()
+                .setCustomId('configure_bot_roles_btn') // Takes them back to the role config main screen
+                .setLabel('Back to Role Configurations')
+                .setStyle(ButtonStyle.Primary);
+
+            await interaction.editReply({ embeds: [successEmbed], components: [new ActionRowBuilder().addComponents(backButton)], ephemeral: true });
+            // interaction.followUp might be better if the original reply for select menu was complex or not from this interaction.
+            // Since set_role_btn uses deferUpdate then followUp, this editReply to the original select menu interaction should be fine.
+
+        } catch (error) {
+            console.error(`Error setting role config for ${configType} to ${selectedRoleId}:`, error);
+            await interaction.editReply({ content: 'An error occurred while saving the role configuration.', components:[], ephemeral: true });
+        }
+
+
     } else if (customIdParts[0] === 'select' && customIdParts[1] === 'global' && customIdParts[2] === 'reward' && customIdParts[3]) {
         // customId: select-global-reward-for-linking-<eventId> (was select-global-reward-<eventId>)
         const eventId = customIdParts[3];
@@ -2469,10 +2701,37 @@ client.on('messageReactionAdd', async (reaction, user) => {
     await linkStore.verify(user.id);
     await user.send('✅ Linked! You may remove the code.');
 
-    if (VERIFIED_ROLE_ID) {
-      const guild = await client.guilds.fetch(GUILD_ID);
-      const member = await guild.members.fetch(user.id).catch(()=>null);
-      member?.roles.add(VERIFIED_ROLE_ID).catch(console.error);
+    // Determine Verified Role ID (DB config or .env fallback)
+    let effectiveVerifiedRoleId = VERIFIED_ROLE_ID; // Fallback to .env
+    if (linkStore && typeof linkStore.getRoleConfig === 'function' && GUILD_ID) {
+        try {
+            const dbRoleConf = await linkStore.getRoleConfig(GUILD_ID, 'VERIFIED_ROLE');
+            if (dbRoleConf && dbRoleConf.role_id) {
+                effectiveVerifiedRoleId = dbRoleConf.role_id;
+                log(`ReactionVerifier: Using VERIFIED_ROLE from DB config: ${effectiveVerifiedRoleId}`);
+            } else {
+                log(`ReactionVerifier: VERIFIED_ROLE not in DB, using .env fallback: ${effectiveVerifiedRoleId}`);
+            }
+        } catch (e) {
+            warn(`ReactionVerifier: Error fetching VERIFIED_ROLE from DB, using .env fallback. Error: ${e.message}`);
+        }
+    } else {
+        warn('ReactionVerifier: linkStore.getRoleConfig not available or GUILD_ID missing. Using .env for VERIFIED_ROLE_ID.');
+    }
+
+    if (effectiveVerifiedRoleId && GUILD_ID) { // Check GUILD_ID again for safety
+      try {
+        const guild = await client.guilds.fetch(GUILD_ID);
+        const member = await guild.members.fetch(user.id).catch(()=>null);
+        if (member) {
+            await member.roles.add(effectiveVerifiedRoleId);
+            log(`ReactionVerifier: Assigned role ${effectiveVerifiedRoleId} to ${user.id}`);
+        } else {
+            warn(`ReactionVerifier: Could not fetch member ${user.id} in guild ${GUILD_ID}.`);
+        }
+      } catch (roleError) {
+          console.error(`ReactionVerifier: Failed to assign role ${effectiveVerifiedRoleId} to ${user.id}:`, roleError.message);
+      }
     }
 
     if (UNIVERSE_ID && OC_KEY) {
