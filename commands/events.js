@@ -699,15 +699,33 @@ function buildEventEmbed(event, envConfig) { // envConfig might be useful for gl
     });
   }
 
-  // Event Rewards display
+  // Event Rewards display (now uses linked global rewards with quantity)
   if (event.rewards && event.rewards.length > 0) {
     embed.addFields({ name: '\u200B', value: '**🎁 Event Rewards:**' }); // Separator
     event.rewards.forEach(reward => {
-      let rewardValue = reward.description || '_No description_';
-      if (reward.image_url) { // Simple link for now, not inline image in field
-        rewardValue += `\n[View Image](${reward.image_url})`;
+      let rewardNameDisplay = reward.name || 'Unknown Reward';
+      if (reward.icon_url) {
+        // Check if icon_url is a standard emoji
+        if (reward.icon_url.match(/^(\p{Emoji_Presentation}|\p{Emoji}\uFE0F)$/u)) {
+          rewardNameDisplay = `${reward.icon_url} ${rewardNameDisplay}`;
+        } else {
+          // For URLs, we might not be able to display an image inline in a field name/value easily.
+          // We can prepend a generic icon or link it in the value.
+          // For now, let's just indicate an icon is present if it's a URL.
+          rewardNameDisplay = `🖼️ ${rewardNameDisplay}`; // Generic picture emoji
+        }
       }
-      embed.addFields({ name: reward.name, value: rewardValue, inline: event.rewards.length > 1 }); // Inline if multiple rewards
+
+      let rewardValue = `Quantity: ${reward.quantity}`;
+      if (reward.description) {
+        rewardValue += `\n*${reward.description.substring(0, 200)}*`; // Show description, truncated
+      }
+      // If icon_url is a URL and we want to link it:
+      // if (reward.icon_url && !reward.icon_url.match(/^(\p{Emoji_Presentation}|\p{Emoji}\uFE0F)$/u)) {
+      //   rewardValue += `\n[Icon URL](${reward.icon_url})`;
+      // }
+
+      embed.addFields({ name: rewardNameDisplay, value: rewardValue, inline: event.rewards.length > 2 ? true : false });
     });
   }
 

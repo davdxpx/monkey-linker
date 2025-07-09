@@ -195,17 +195,19 @@ async function initSqlite(DB_PATH = './links.db') {
       db.exec(`CREATE INDEX IF NOT EXISTS idx_bot_permissions_user_id ON bot_permissions(user_id);`);
       db.exec(`CREATE INDEX IF NOT EXISTS idx_bot_permissions_is_moderator ON bot_permissions(is_moderator);`);
 
-      // Event Rewards Table
+      // Event Rewards Table (Now links to Global Reward Types)
+      db.exec(`DROP TABLE IF EXISTS event_rewards;`); // Drop old table if it exists to apply new schema
       db.exec(`CREATE TABLE IF NOT EXISTS event_rewards (
-          reward_id INTEGER PRIMARY KEY AUTOINCREMENT,
-          event_id INTEGER NOT NULL,
-          name TEXT NOT NULL,
-          description TEXT,
-          image_url TEXT,
+          event_reward_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_id TEXT NOT NULL,
+          global_reward_type_id TEXT NOT NULL,
+          quantity INTEGER NOT NULL DEFAULT 1,
           display_order INTEGER DEFAULT 0,
-          FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
+          FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
+          FOREIGN KEY (global_reward_type_id) REFERENCES global_reward_types(reward_type_id) ON DELETE CASCADE -- Or SET NULL / RESTRICT
       );`);
       db.exec(`CREATE INDEX IF NOT EXISTS idx_event_rewards_event_id ON event_rewards(event_id);`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_event_rewards_global_reward_type_id ON event_rewards(global_reward_type_id);`);
 
       // Global Reward Types Table
       db.exec(`CREATE TABLE IF NOT EXISTS global_reward_types (
@@ -214,7 +216,8 @@ async function initSqlite(DB_PATH = './links.db') {
           description TEXT,
           creator_discord_id TEXT NOT NULL,
           created_at INTEGER NOT NULL,
-          updated_at INTEGER NOT NULL
+          updated_at INTEGER NOT NULL,
+          icon_url TEXT
       );`);
       db.exec(`CREATE INDEX IF NOT EXISTS idx_global_reward_types_name ON global_reward_types(name);`);
 
@@ -347,31 +350,48 @@ async function initSqlite(DB_PATH = './links.db') {
         return sql.run('DELETE FROM event_custom_fields WHERE event_id = ?', [eventId]);
       },
 
-      // Event Reward Methods (SQLite)
-      addEventReward: (eventId, name, description, imageUrl, displayOrder = 0) => {
+      // Event Reward Methods (SQLite) - Reworked for linked global rewards
+      linkEventReward: (eventId, globalRewardTypeId, quantity, displayOrder = 0) => {
         return sql.run(
-          `INSERT INTO event_rewards (event_id, name, description, image_url, display_order) VALUES (?, ?, ?, ?, ?)`,
-          [eventId, name, description, imageUrl, displayOrder]
-        ).then(function() { return this.lastID; });
+          `INSERT INTO event_rewards (event_id, global_reward_type_id, quantity, display_order) VALUES (?, ?, ?, ?)`,
+          [eventId, globalRewardTypeId, quantity, displayOrder]
+        ).then(function() { return this.lastID; }); // Returns event_reward_id
       },
       getEventRewards: (eventId) => {
-        return sql.all('SELECT * FROM event_rewards WHERE event_id = ? ORDER BY display_order ASC, reward_id ASC', [eventId]);
+        // Join with global_reward_types to get details
+        return sql.all(
+          `SELECT
+             er.event_reward_id, er.event_id, er.global_reward_type_id, er.quantity, er.display_order,
+             grt.name, grt.description, grt.icon_url, grt.creator_discord_id AS global_reward_creator_id, grt.created_at AS global_reward_created_at
+           FROM event_rewards er
+           JOIN global_reward_types grt ON er.global_reward_type_id = grt.reward_type_id
+           WHERE er.event_id = ?
+           ORDER BY er.display_order ASC, er.event_reward_id ASC`,
+          [eventId]
+        );
       },
-      updateEventReward: (rewardId, name, description, imageUrl, displayOrder) => {
-        const updates = [];
-        const values = [];
-        if (name !== undefined) { updates.push('name = ?'); values.push(name); }
-        if (description !== undefined) { updates.push('description = ?'); values.push(description); }
-        if (imageUrl !== undefined) { updates.push('image_url = ?'); values.push(imageUrl); }
-        if (displayOrder !== undefined) { updates.push('display_order = ?'); values.push(displayOrder); }
-        if (updates.length === 0) return Promise.resolve();
-        values.push(rewardId);
-        return sql.run(`UPDATE event_rewards SET ${updates.join(', ')} WHERE reward_id = ?`, values);
+      updateEventRewardQuantity: (eventRewardId, quantity) => {
+        if (quantity === undefined || quantity < 1) return Promise.reject(new Error("Quantity must be a positive integer."));
+        return sql.run(
+          `UPDATE event_rewards SET quantity = ? WHERE event_reward_id = ?`,
+          [quantity, eventRewardId]
+        );
       },
-      deleteEventReward: (rewardId) => {
-        return sql.run('DELETE FROM event_rewards WHERE reward_id = ?', [rewardId]);
+      deleteEventReward: (eventRewardId) => { // Now takes event_reward_id (PK of the link table)
+        return sql.run('DELETE FROM event_rewards WHERE event_reward_id = ?', [eventRewardId]);
       },
-      deleteEventRewardsByEventId: (eventId) => {
+      getSpecificEventReward: (eventRewardId) => { // New method to get a single linked reward with its details
+        return sql.get(
+          `SELECT
+             er.event_reward_id, er.event_id, er.global_reward_type_id, er.quantity, er.display_order,
+             grt.name, grt.description, grt.icon_url
+           FROM event_rewards er
+           JOIN global_reward_types grt ON er.global_reward_type_id = grt.reward_type_id
+           WHERE er.event_reward_id = ?`,
+          [eventRewardId]
+        );
+      },
+      deleteEventRewardsByEventId: (eventId) => { // This remains useful for cleaning up all linked rewards for an event
         return sql.run('DELETE FROM event_rewards WHERE event_id = ?', [eventId]);
       },
 
@@ -422,12 +442,12 @@ async function initSqlite(DB_PATH = './links.db') {
       },
 
       // Global Reward Type Methods (SQLite)
-      createGlobalRewardType: (rewardTypeId, name, description, creatorId) => {
+      createGlobalRewardType: (rewardTypeId, name, description, creatorId, iconUrl = null) => {
         const now = Math.floor(Date.now() / 1000);
         return sql.run(
-          `INSERT INTO global_reward_types (reward_type_id, name, description, creator_discord_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [rewardTypeId, name, description, creatorId, now, now]
+          `INSERT INTO global_reward_types (reward_type_id, name, description, creator_discord_id, created_at, updated_at, icon_url)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [rewardTypeId, name, description, creatorId, now, now, iconUrl]
         );
       },
       getGlobalRewardTypeById: (id) => {
@@ -439,15 +459,16 @@ async function initSqlite(DB_PATH = './links.db') {
       getAllGlobalRewardTypes: () => {
         return sql.all('SELECT * FROM global_reward_types ORDER BY name ASC');
       },
-      updateGlobalRewardType: (id, name, description) => {
+      updateGlobalRewardType: (id, name, description, iconUrl) => {
         const now = Math.floor(Date.now() / 1000);
         // Ensure that only provided fields are updated.
         const updates = [];
         const values = [];
         if (name !== undefined) { updates.push('name = ?'); values.push(name); }
         if (description !== undefined) { updates.push('description = ?'); values.push(description); }
+        if (iconUrl !== undefined) { updates.push('icon_url = ?'); values.push(iconUrl); } // iconUrl can be null to clear it
 
-        if (updates.length === 0) return Promise.resolve(); // No fields to update
+        if (updates.length === 0) return Promise.resolve(); // No actual fields to update besides timestamp
 
         updates.push('updated_at = ?');
         values.push(now);
@@ -517,8 +538,9 @@ async function initMongoBackend(cfg) {
   const eventTemplatesCol = db.collection('event_templates');
   await eventTemplatesCol.createIndex({ template_name: 1 }, { unique: true });
 
-  const eventRewardsCol = db.collection('event_rewards');
+  const eventRewardsCol = db.collection('event_rewards'); // This will store links and quantities
   await eventRewardsCol.createIndex({ event_id: 1 });
+  await eventRewardsCol.createIndex({ global_reward_type_id: 1 });
 
   const botPermissionsCol = db.collection('bot_permissions');
   await botPermissionsCol.createIndex({ user_id: 1 }, { unique: true });
@@ -630,30 +652,92 @@ async function initMongoBackend(cfg) {
         return eventCustomFieldsCol.deleteMany({ event_id: eventId });
     },
 
-    // Event Reward Methods (MongoDB)
-    addEventReward: async (eventId, name, description, imageUrl, displayOrder = 0) => {
-        const result = await eventRewardsCol.insertOne({ event_id: eventId, name, description, image_url: imageUrl, display_order: displayOrder });
-        return result.insertedId;
+    // Event Reward Methods (MongoDB) - Reworked
+    linkEventReward: async (eventId, globalRewardTypeId, quantity, displayOrder = 0) => {
+      const result = await eventRewardsCol.insertOne({
+        event_id: eventId,
+        global_reward_type_id: globalRewardTypeId,
+        quantity: quantity,
+        display_order: displayOrder,
+        linked_at: Math.floor(Date.now() / 1000)
+      });
+      return result.insertedId; // This is the _id of the event_rewards document (the link itself)
     },
-    getEventRewards: (eventId) => {
-        return eventRewardsCol.find({ event_id: eventId }).sort({ display_order: 1, _id: 1 }).toArray();
+    getEventRewards: async (eventId) => {
+      // Need to perform a lookup (equivalent to JOIN)
+      const rewards = await eventRewardsCol.aggregate([
+        { $match: { event_id: eventId } },
+        {
+          $lookup: {
+            from: 'global_reward_types', // The collection name for global_reward_types
+            localField: 'global_reward_type_id',
+            foreignField: '_id', // Assuming global_reward_type_id in event_rewards links to _id in global_reward_types
+            as: 'globalRewardDetails'
+          }
+        },
+        // Handle cases where a global reward might have been deleted after linking
+        {
+          $unwind: {
+            path: "$globalRewardDetails",
+            preserveNullAndEmptyArrays: true // Keep event_rewards link even if global_reward_type is missing
+          }
+        },
+        {
+          $project: { // Shape the output
+            _id: 1,
+            event_reward_id: '$_id',
+            event_id: 1,
+            global_reward_type_id: 1,
+            quantity: 1,
+            display_order: 1,
+            // Use $ifNull to provide default values if globalRewardDetails is missing (due to deletion)
+            name: { $ifNull: ['$globalRewardDetails.name', 'Deleted Reward Type'] },
+            description: { $ifNull: ['$globalRewardDetails.description', 'Details unavailable'] },
+            icon_url: { $ifNull: ['$globalRewardDetails.icon_url', null] },
+          }
+        },
+        { $sort: { display_order: 1, _id: 1 } }
+      ]).toArray();
+      return rewards;
     },
-    updateEventReward: (rewardId, name, description, imageUrl, displayOrder) => {
-        const updates = {};
-        if (name !== undefined) updates.name = name;
-        if (description !== undefined) updates.description = description;
-        if (imageUrl !== undefined) updates.image_url = imageUrl;
-        if (displayOrder !== undefined) updates.display_order = displayOrder;
-        if (Object.keys(updates).length === 0) return Promise.resolve();
-        const { ObjectId } = require('mongodb');
-        return eventRewardsCol.updateOne({ _id: new ObjectId(rewardId) }, { $set: updates });
+    updateEventRewardQuantity: (eventRewardId, quantity) => {
+      if (quantity === undefined || quantity < 1) return Promise.reject(new Error("Quantity must be a positive integer."));
+      const { ObjectId } = require('mongodb');
+      return eventRewardsCol.updateOne(
+        { _id: new ObjectId(eventRewardId) },
+        { $set: { quantity: quantity } }
+      );
     },
-    deleteEventReward: (rewardId) => {
-        const { ObjectId } = require('mongodb');
-        return eventRewardsCol.deleteOne({ _id: new ObjectId(rewardId) });
+    deleteEventReward: (eventRewardId) => { // eventRewardId is the _id of the link document
+      const { ObjectId } = require('mongodb');
+      return eventRewardsCol.deleteOne({ _id: new ObjectId(eventRewardId) });
     },
-    deleteEventRewardsByEventId: (eventId) => {
-        return eventRewardsCol.deleteMany({ event_id: eventId });
+    getSpecificEventReward: async (eventRewardId) => { // New method for MongoDB
+      const { ObjectId } = require('mongodb');
+      const rewards = await eventRewardsCol.aggregate([
+        { $match: { _id: new ObjectId(eventRewardId) } },
+        {
+          $lookup: {
+            from: 'global_reward_types',
+            localField: 'global_reward_type_id',
+            foreignField: '_id',
+            as: 'globalRewardDetails'
+          }
+        },
+        { $unwind: { path: "$globalRewardDetails", preserveNullAndEmptyArrays: true } },
+        {
+          $project: {
+            _id: 1, event_reward_id: '$_id', event_id: 1, global_reward_type_id: 1, quantity: 1, display_order: 1,
+            name: { $ifNull: ['$globalRewardDetails.name', 'Deleted Reward Type'] },
+            description: { $ifNull: ['$globalRewardDetails.description', 'Details unavailable'] },
+            icon_url: { $ifNull: ['$globalRewardDetails.icon_url', null] },
+          }
+        }
+      ]).toArray();
+      return rewards.length > 0 ? rewards[0] : null;
+    },
+    deleteEventRewardsByEventId: (eventId) => { // This remains useful
+      return eventRewardsCol.deleteMany({ event_id: eventId });
     },
 
     // Event Template Methods (MongoDB)
@@ -720,13 +804,14 @@ async function initMongoBackend(cfg) {
     },
 
     // Global Reward Type Methods (MongoDB)
-    createGlobalRewardType: async (rewardTypeId, name, description, creatorId) => {
+    createGlobalRewardType: async (rewardTypeId, name, description, creatorId, iconUrl = null) => {
       const now = Math.floor(Date.now() / 1000);
       await globalRewardTypesCol.insertOne({
         _id: rewardTypeId, // Use rewardTypeId as MongoDB _id
         reward_type_id: rewardTypeId,
         name,
         description,
+        icon_url: iconUrl,
         creator_discord_id: creatorId,
         created_at: now,
         updated_at: now,
@@ -742,13 +827,16 @@ async function initMongoBackend(cfg) {
     getAllGlobalRewardTypes: () => {
       return globalRewardTypesCol.find({}).sort({ name: 1 }).toArray();
     },
-    updateGlobalRewardType: (id, name, description) => {
+    updateGlobalRewardType: (id, name, description, iconUrl) => {
       const now = Math.floor(Date.now() / 1000);
       const updates = { updated_at: now };
       if (name !== undefined) updates.name = name;
       if (description !== undefined) updates.description = description;
+      if (iconUrl !== undefined) updates.icon_url = iconUrl; // Handles null to clear, or new URL
 
-      if (Object.keys(updates).length <= 1) return Promise.resolve(); // Only updated_at, no actual change
+      // Check if only updated_at is present (meaning no actual data fields changed)
+      const fieldUpdateKeys = Object.keys(updates).filter(key => key !== 'updated_at');
+      if (fieldUpdateKeys.length === 0) return Promise.resolve();
 
       return globalRewardTypesCol.updateOne({ _id: id }, { $set: updates });
     },
@@ -1158,41 +1246,123 @@ client.on('interactionCreate', async interaction => {
         await interaction.editReply({ content: `Changing location for Event #${eventId}. Please select the new island.`, embeds: [], components: [row] });
 
     } else if (prefix === 'manage' && action === 'event' && customIdParts[2] === 'rewards' && customIdParts[3]) {
-        // manage-event-rewards-<eventId>
+        // manage-event-rewards-<eventId> - Reworked
         const eventId = customIdParts[3]; // Event ID is now a string
-        await interaction.deferUpdate(); // Defer update before showing modal/options
-        const { ModalBuilder, TextInputBuilder, ActionRowBuilder, StringSelectMenuBuilder, EmbedBuilder, ButtonStyle } = require('discord.js');
+        await interaction.deferReply({ ephemeral: true }); // Changed from deferUpdate to deferReply for a fresh reply
+        const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 
-        // Fetch existing rewards for context if needed, or just show management options
-        const eventBeingManaged = await linkStore.getEventById(eventId);
-        if (!eventBeingManaged) {
-            return interaction.editReply({ content: 'Could not find the event to manage rewards for.', components: [] });
+        try {
+            const eventBeingManaged = await linkStore.getEventById(eventId);
+            if (!eventBeingManaged) {
+                return interaction.editReply({ content: 'Could not find the event to manage rewards for.', components: [] });
+            }
+
+            const linkedRewards = await linkStore.getEventRewards(eventId); // This now returns joined data
+
+            const manageRewardsEmbed = new EmbedBuilder()
+                .setColor(0x00BCD4)
+                .setTitle(`🎁 Rewards for: ${eventBeingManaged.title.substring(0, 200)}`)
+                .setTimestamp();
+
+            const components = [];
+            let descriptionLines = ['Current rewards linked to this event:'];
+
+            if (!linkedRewards || linkedRewards.length === 0) {
+                descriptionLines.push('No rewards are currently linked to this event.');
+            } else {
+                linkedRewards.forEach(lr => {
+                    let iconDisplay = lr.icon_url ? (lr.icon_url.match(/^(\p{Emoji_Presentation}|\p{Emoji}\uFE0F)$/u) ? lr.icon_url : '[Icon]') : '';
+                    descriptionLines.push(`${iconDisplay} **${lr.name}** (Quantity: ${lr.quantity}) - ID: \`${lr.event_reward_id}\``);
+                    // Add buttons for each linked reward (up to component limits)
+                    // For simplicity in this pass, we'll add one row per reward if few, or paginate later.
+                    // This example just lists; buttons will be complex to add dynamically here.
+                    // Instead, we'll have general buttons below the list.
+                });
+                 // Simplified for now: Buttons to edit/unlink will be part of a more complex UI or separate commands if list is long.
+                 // For this step, let's focus on listing and the "Link New" button.
+                 // A better UI might involve select menus to pick a reward to edit/unlink.
+            }
+            manageRewardsEmbed.setDescription(descriptionLines.join('\n').substring(0, 4090));
+
+            // Add "Link New Global Reward" button
+            const linkNewButton = new ButtonBuilder()
+                .setCustomId(`link_new_global_reward_btn-${eventId}`)
+                .setLabel('Link New Global Reward')
+                .setStyle(ButtonStyle.Success)
+                .setEmoji('🔗');
+            components.push(new ActionRowBuilder().addComponents(linkNewButton));
+
+            // Placeholder: Add buttons for "Edit Quantity" and "Unlink" later if needed.
+            // These would likely require selecting a reward first.
+            // For now, the user would manage quantities/unlinking by re-linking or via a future specific command.
+            // Or, we can add "Manage Existing Links" button which then lists them with edit/unlink buttons.
+            // Let's add a generic way to manage existing for now.
+            if (linkedRewards && linkedRewards.length > 0) {
+                 const manageExistingButton = new ButtonBuilder()
+                    .setCustomId(`manage_existing_linked_rewards-${eventId}`)
+                    .setLabel('Manage Existing Links')
+                    .setStyle(ButtonStyle.Primary)
+                    .setEmoji('✏️');
+                // Check if the first row already has max components
+                if (components[0] && components[0].components.length < 5) {
+                    components[0].addComponents(manageExistingButton);
+                } else {
+                    components.push(new ActionRowBuilder().addComponents(manageExistingButton));
+                }
+            }
+
+
+            await interaction.editReply({ embeds: [manageRewardsEmbed], components: components, ephemeral: true });
+
+        } catch (error) {
+            console.error(`Error in manage-event-rewards-${eventId}:`, error);
+            await interaction.editReply({ content: 'An error occurred while fetching event reward data.', ephemeral: true });
         }
 
-        const manageRewardsEmbed = new EmbedBuilder()
+
+    } else if (interaction.customId.startsWith('manage_existing_linked_rewards-')) {
+        const eventId = interaction.customId.split('-')[1];
+        await interaction.deferReply({ephemeral: true});
+        const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+        const linkedRewards = await linkStore.getEventRewards(eventId);
+
+        if (!linkedRewards || linkedRewards.length === 0) {
+            return interaction.editReply({ content: 'No rewards are currently linked to this event to manage.', components: [], ephemeral: true });
+        }
+
+        const listEmbed = new EmbedBuilder()
             .setColor(0x00BCD4)
-            .setTitle(`🎁 Manage Rewards for: ${eventBeingManaged.title.substring(0, 200)}`)
-            .setDescription('Add a new custom reward, or add from a predefined global reward type.')
-            .setTimestamp();
+            .setTitle(`✏️ Manage Existing Rewards for Event #${eventId}`)
+            .setDescription('Select a reward to edit its quantity or unlink it.');
 
-        const actionRow = new ActionRowBuilder()
-            .addComponents(
+        const components = [];
+        // Max 5 action rows, max 5 buttons per row.
+        // Each reward gets an Edit Qty and Unlink button. So 1 reward per row for clarity, or 2 if space is tight.
+        for (let i = 0; i < linkedRewards.length && components.length < 5; i++) {
+            const lr = linkedRewards[i];
+            const actionRow = new ActionRowBuilder();
+            let iconDisplay = lr.icon_url ? (lr.icon_url.match(/^(\p{Emoji_Presentation}|\p{Emoji}\uFE0F)$/u) ? lr.icon_url + " " : '') : '';
+
+            actionRow.addComponents(
                 new ButtonBuilder()
-                    .setCustomId(`add_custom_event_reward_btn-${eventId}`) // New custom ID for clarity
-                    .setLabel('Add New Custom Reward')
-                    .setStyle(ButtonStyle.Success)
-                    .setEmoji('➕'),
+                    .setCustomId(`edit_event_reward_qty_btn-${lr.event_reward_id}`) // event_reward_id is PK of the link
+                    .setLabel(`Qty for: ${iconDisplay}${lr.name.substring(0, 30)} (Currently ${lr.quantity})`)
+                    .setStyle(ButtonStyle.Secondary),
                 new ButtonBuilder()
-                    .setCustomId(`add_predefined_event_reward_btn-${eventId}`)
-                    .setLabel('Add From Predefined')
-                    .setStyle(ButtonStyle.Primary)
-                    .setEmoji('📚')
+                    .setCustomId(`unlink_event_reward_btn-${lr.event_reward_id}`)
+                    .setLabel(`Unlink ${lr.name.substring(0, 20)}`)
+                    .setStyle(ButtonStyle.Danger)
             );
-        // TODO: Add a button to "View/Remove Existing Event Rewards" later if needed.
+            components.push(actionRow);
+        }
+         if (linkedRewards.length > 5) {
+            listEmbed.setFooter({text: `Showing management options for the first 5 linked rewards.`});
+        }
 
-        await interaction.editReply({ embeds: [manageRewardsEmbed], components: [actionRow], ephemeral: true });
+        await interaction.editReply({embeds: [listEmbed], components: components, ephemeral: true});
 
-    } else if (interaction.customId.startsWith('add_predefined_event_reward_btn-')) {
+
+    } else if (interaction.customId.startsWith('link_new_global_reward_btn-')) { // Renamed from add_predefined_event_reward_btn
         const eventId = interaction.customId.split('-')[1];
         await interaction.deferUpdate(); // Acknowledge this button click before replying
         const { StringSelectMenuBuilder, StringSelectMenuOptionBuilder, ActionRowBuilder, EmbedBuilder } = require('discord.js');
@@ -1309,9 +1479,17 @@ client.on('interactionCreate', async interaction => {
         .setRequired(false)
         .setMaxLength(500);
 
+      const iconUrlInput = new TextInputBuilder()
+        .setCustomId('rewardTypeIconUrlInput')
+        .setLabel("Icon URL or Emoji (Optional)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(false)
+        .setMaxLength(255); // Typical URL length limit
+
       modal.addComponents(
         new ActionRowBuilder().addComponents(nameInput),
-        new ActionRowBuilder().addComponents(descriptionInput)
+        new ActionRowBuilder().addComponents(descriptionInput),
+        new ActionRowBuilder().addComponents(iconUrlInput)
       );
       await interaction.showModal(modal);
 
@@ -1340,9 +1518,19 @@ client.on('interactionCreate', async interaction => {
           for (let i = 0; i < rewardTypes.length; i++) {
             const rt = rewardTypes[i];
             if (i < maxFields) {
+                let valueString = `ID: \`${rt.reward_type_id}\`\nDesc: ${rt.description || '_No description_'}`;
+                if (rt.icon_url) {
+                    // Check if it's likely an emoji (single character, possibly variant selector)
+                    if (rt.icon_url.match(/^(\p{Emoji_Presentation}|\p{Emoji}\uFE0F)$/u)) {
+                        valueString += `\nIcon: ${rt.icon_url}`;
+                    } else { // Assume URL
+                        valueString += `\nIcon URL: ${rt.icon_url.length > 100 ? rt.icon_url.substring(0,97) + '...' : rt.icon_url}`; // Truncate long URLs
+                    }
+                }
+                valueString += `\nCreated by <@${rt.creator_discord_id}> on <t:${rt.created_at}:D>`;
                  listEmbed.addFields({
                     name: rt.name,
-                    value: `ID: \`${rt.reward_type_id}\`\nDesc: ${rt.description || '_No description_'}\nCreated by <@${rt.creator_discord_id}> on <t:${rt.created_at}:D>`,
+                    value: valueString,
                     inline: false
                 });
             }
@@ -1418,9 +1606,18 @@ client.on('interactionCreate', async interaction => {
                 .setValue(rewardType.description || '')
                 .setMaxLength(500);
 
+            const iconUrlInput = new TextInputBuilder()
+                .setCustomId('rewardTypeIconUrlInput')
+                .setLabel("Icon URL or Emoji (Optional)")
+                .setStyle(TextInputStyle.Short)
+                .setRequired(false)
+                .setValue(rewardType.icon_url || '')
+                .setMaxLength(255);
+
             modal.addComponents(
                 new ActionRowBuilder().addComponents(nameInput),
-                new ActionRowBuilder().addComponents(descriptionInput)
+                new ActionRowBuilder().addComponents(descriptionInput),
+                new ActionRowBuilder().addComponents(iconUrlInput)
             );
             await interaction.showModal(modal);
 
@@ -1587,11 +1784,97 @@ client.on('interactionCreate', async interaction => {
             console.error('Error setting RSVP role:', error);
             await interaction.editReply({ content: 'An error occurred while setting the RSVP role.', ephemeral: true });
         }
+    } else if (interaction.customId.startsWith('setEventRewardQuantityModal-')) {
+        // Format: setEventRewardQuantityModal-<eventId>-<globalRewardTypeId>
+        const parts = interaction.customId.split('-');
+        const eventId = parts[1];
+        const globalRewardTypeId = parts[2];
+        await interaction.deferReply({ ephemeral: true });
+        const quantityStr = interaction.fields.getTextInputValue('eventRewardQuantityInput');
+        const quantity = parseInt(quantityStr, 10);
+        const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+
+
+        if (isNaN(quantity) || quantity < 1) {
+            return interaction.editReply({ content: 'Invalid quantity. Please enter a positive number.', ephemeral: true });
+        }
+
+        try {
+            await linkStore.linkEventReward(eventId, globalRewardTypeId, quantity);
+            const globalReward = await linkStore.getGlobalRewardTypeById(globalRewardTypeId); // For name in reply
+            const successEmbed = new EmbedBuilder()
+                .setColor(0x4CAF50)
+                .setTitle('✅ Reward Linked to Event')
+                .setDescription(`Successfully linked global reward **${globalReward?.name || 'Selected Reward'}** with quantity **${quantity}** to event #${eventId}.`)
+                .setTimestamp();
+
+            // Provide buttons to link another or go back to managing this event's rewards
+            const followupRow = new ActionRowBuilder()
+                .addComponents(
+                    new ButtonBuilder()
+                        .setCustomId(`link_new_global_reward_btn-${eventId}`)
+                        .setLabel('Link Another Reward')
+                        .setStyle(ButtonStyle.Success),
+                    new ButtonBuilder()
+                        .setCustomId(`manage-event-rewards-${eventId.split('_')[0]}-${eventId.split('_')[1]}-${eventId.split('_')[2]}-${eventId.split('_')[3]}`) // Reconstruct original manage ID
+                        .setLabel('Back to Event Rewards')
+                        .setStyle(ButtonStyle.Primary)
+                );
+
+            await interaction.editReply({ embeds: [successEmbed], components: [followupRow], ephemeral: true });
+        } catch (error) {
+            console.error(`Error linking global reward ${globalRewardTypeId} to event ${eventId} with quantity ${quantity}:`, error);
+            await interaction.editReply({ content: 'An error occurred while linking the reward to the event.', ephemeral: true });
+        }
+
+    } else if (interaction.customId.startsWith('updateEventRewardQuantityModal-')) {
+        const eventSpecificRewardId = interaction.customId.replace('updateEventRewardQuantityModal-', '');
+        await interaction.deferReply({ ephemeral: true });
+        const quantityStr = interaction.fields.getTextInputValue('eventRewardQuantityInput');
+        const quantity = parseInt(quantityStr, 10);
+        const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+
+        if (isNaN(quantity) || quantity < 1) {
+            return interaction.editReply({ content: 'Invalid quantity. Please enter a positive number.', ephemeral: true });
+        }
+
+        try {
+            await linkStore.updateEventRewardQuantity(eventSpecificRewardId, quantity);
+            const updatedRewardInfo = await linkStore.getSpecificEventReward(eventSpecificRewardId); // Get name for reply
+
+            const successEmbed = new EmbedBuilder()
+                .setColor(0x4CAF50)
+                .setTitle('✅ Reward Quantity Updated')
+                .setDescription(`Quantity for reward **${updatedRewardInfo?.name || 'Reward'}** (Link ID: \`${eventSpecificRewardId}\`) updated to **${quantity}**.`)
+                .setTimestamp();
+
+            // Button to go back to managing this event's rewards. Need eventId.
+            // We'd need to fetch the eventId from updatedRewardInfo.event_id
+            const eventId = updatedRewardInfo?.event_id;
+            const actionRow = new ActionRowBuilder();
+            if (eventId) {
+                 actionRow.addComponents(
+                     new ButtonBuilder()
+                        .setCustomId(`manage-event-rewards-${eventId.split('_')[0]}-${eventId.split('_')[1]}-${eventId.split('_')[2]}-${eventId.split('_')[3]}`)
+                        .setLabel('Back to Event Rewards')
+                        .setStyle(ButtonStyle.Primary)
+                 );
+            }
+
+
+            await interaction.editReply({ embeds: [successEmbed], components: actionRow.components.length > 0 ? [actionRow] : [], ephemeral: true });
+        } catch (error) {
+            console.error(`Error updating quantity for event reward ${eventSpecificRewardId}:`, error);
+            await interaction.editReply({ content: 'An error occurred while updating the reward quantity.', ephemeral: true });
+        }
+
+
     } else if (interaction.customId.startsWith('editGlobalRewardTypeModal-')) {
         const rewardTypeId = interaction.customId.replace('editGlobalRewardTypeModal-', '');
         await interaction.deferReply({ ephemeral: true });
         const name = interaction.fields.getTextInputValue('rewardTypeNameInput');
         const description = interaction.fields.getTextInputValue('rewardTypeDescriptionInput');
+        const iconUrl = interaction.fields.getTextInputValue('rewardTypeIconUrlInput') || null; // Get icon_url
         const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 
         try {
@@ -1604,7 +1887,7 @@ client.on('interactionCreate', async interaction => {
                 }
             }
 
-            await linkStore.updateGlobalRewardType(rewardTypeId, name, description);
+            await linkStore.updateGlobalRewardType(rewardTypeId, name, description, iconUrl); // Pass iconUrl
 
             const successEmbed = new EmbedBuilder()
                 .setColor(0x4CAF50) // SUCCESS_COLOR
@@ -1635,6 +1918,7 @@ client.on('interactionCreate', async interaction => {
       await interaction.deferReply({ ephemeral: true });
       const name = interaction.fields.getTextInputValue('rewardTypeNameInput');
       const description = interaction.fields.getTextInputValue('rewardTypeDescriptionInput');
+      const iconUrl = interaction.fields.getTextInputValue('rewardTypeIconUrlInput') || null; // Get icon_url
       const { generateRewardTypeId } = require('./utils/idGenerator');
       const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 
@@ -1645,7 +1929,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         const rewardTypeId = generateRewardTypeId();
-        await linkStore.createGlobalRewardType(rewardTypeId, name, description, interaction.user.id);
+        await linkStore.createGlobalRewardType(rewardTypeId, name, description, interaction.user.id, iconUrl); // Pass iconUrl
 
         const successEmbed = new EmbedBuilder()
             .setColor(0x4CAF50) // SUCCESS_COLOR
@@ -1915,48 +2199,101 @@ client.on('interactionCreate', async interaction => {
             console.warn(`[INDEX_HANDLER] Could not send user-facing error for area select for event ${eventId} as interaction might be invalid.`);
         }
     } else if (customIdParts[0] === 'select' && customIdParts[1] === 'global' && customIdParts[2] === 'reward' && customIdParts[3]) {
-        // customId: select-global-reward-<eventId>
+        // customId: select-global-reward-for-linking-<eventId> (was select-global-reward-<eventId>)
         const eventId = customIdParts[3];
-        const selectedGlobalRewardId = interaction.values[0].replace('gr-', ''); // Remove prefix
-        await interaction.deferUpdate(); // Acknowledge select menu
+        const selectedGlobalRewardId = interaction.values[0].replace('gr-', '');
+        // No deferUpdate needed here as we are showing a modal
+        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
 
-        try {
-            const globalReward = await linkStore.getGlobalRewardTypeById(selectedGlobalRewardId);
-            if (!globalReward) {
-                return interaction.editReply({ content: 'The selected predefined reward type could not be found. It might have been deleted.', components: [], ephemeral: true });
-            }
+        const modal = new ModalBuilder()
+            .setCustomId(`setEventRewardQuantityModal-${eventId}-${selectedGlobalRewardId}`)
+            .setTitle('Set Reward Quantity');
 
-            // Add this global reward as a new event-specific reward
-            // The `addEventReward` function takes: eventId, name, description, imageUrl, displayOrder
-            // We'll copy name and description. ImageUrl and displayOrder can be null/0 or managed later.
-            await linkStore.addEventReward(eventId, globalReward.name, globalReward.description, null, 0);
+        const quantityInput = new TextInputBuilder()
+            .setCustomId('eventRewardQuantityInput')
+            .setLabel("Quantity for this reward")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setValue('1') // Default to 1
+            .setPlaceholder('e.g., 1, 5, 10');
 
-            const successEmbed = new EmbedBuilder()
-                .setColor(0x4CAF50)
-                .setTitle('✅ Reward Added to Event')
-                .setDescription(`The predefined reward "**${globalReward.name}**" has been added to event #${eventId}.`)
-                .setTimestamp();
+        modal.addComponents(new ActionRowBuilder().addComponents(quantityInput));
+        await interaction.showModal(modal);
+        // Modal submission will handle the rest.
 
-            // Buttons to allow adding another or finishing
-            const followupActionRow = new ActionRowBuilder()
-                .addComponents(
-                    new ButtonBuilder()
-                        .setCustomId(`add_predefined_event_reward_btn-${eventId}`) // Go back to select another predefined
-                        .setLabel('Add Another Predefined')
-                        .setStyle(ButtonStyle.Primary),
-                    new ButtonBuilder()
-                        .setCustomId(`add_custom_event_reward_btn-${eventId}`) // Option to add a fully custom one
-                        .setLabel('Add Custom Reward')
-                        .setStyle(ButtonStyle.Success),
-                    // Consider a "Finish Managing Rewards" button that takes them back to the main /events edit options or similar
-                );
+    } else if (interaction.customId.startsWith('edit_event_reward_qty_btn-')) {
+        const eventSpecificRewardId = interaction.customId.split('-')[1];
+        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+        // We need to fetch the current quantity to pre-fill the modal.
+        // This requires a method to get a single event_reward link by its ID.
+        // Let's assume linkStore.getEventRewardLinkById(eventSpecificRewardId) exists or add it.
+        // For now, let's proceed assuming we can get the quantity.
+        // This part of the logic might need a new linkStore method: getSpecificEventReward(eventRewardId)
+        // which returns the joined data like getEventRewards but for a single link.
+        // Or, we can pass current quantity in customId if feasible, but that's messy.
+        // Let's make a placeholder for current quantity.
 
-            await interaction.editReply({ embeds: [successEmbed], components: [followupActionRow], ephemeral: true });
-
-        } catch (error) {
-            console.error(`Error adding global reward ${selectedGlobalRewardId} to event ${eventId}:`, error);
-            await interaction.editReply({ content: 'An error occurred while adding the predefined reward to the event.', components: [], ephemeral: true });
+        // Simplified: Assuming we can get the eventId from the eventSpecificRewardId if needed for title
+        // For now, just use a generic title.
+        // Fetch the specific reward to pre-fill quantity and potentially name in title
+        const specificReward = await linkStore.getSpecificEventReward(eventSpecificRewardId);
+        if (!specificReward) {
+            return interaction.reply({ content: 'Could not find the specific reward link to edit.', ephemeral: true });
         }
+
+        const modal = new ModalBuilder()
+            .setCustomId(`updateEventRewardQuantityModal-${eventSpecificRewardId}`)
+            .setTitle(`Edit Qty: ${specificReward.name.substring(0,30)}`);
+
+        const quantityInput = new TextInputBuilder()
+            .setCustomId('eventRewardQuantityInput')
+            .setLabel("New quantity for this reward")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setValue(specificReward.quantity.toString()) // Pre-fill with current quantity
+            .setPlaceholder('e.g., 1, 5, 10');
+
+        modal.addComponents(new ActionRowBuilder().addComponents(quantityInput));
+        await interaction.showModal(modal);
+
+    } else if (interaction.customId.startsWith('unlink_event_reward_btn-')) {
+        const eventSpecificRewardId = interaction.customId.split('-')[1];
+        const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+        // Fetch details for confirmation message
+        // This would ideally use a new linkStore.getSpecificEventReward(eventSpecificRewardId)
+        // For now, a generic message.
+        const confirmEmbed = new EmbedBuilder()
+            .setColor(0xFFC107)
+            .setTitle('🗑️ Confirm Unlink Reward')
+            .setDescription(`Are you sure you want to unlink this reward from the event? (ID: \`${eventSpecificRewardId}\`)`)
+            .setTimestamp();
+        const row = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`confirm_unlink_event_reward-${eventSpecificRewardId}`)
+                    .setLabel('Confirm Unlink')
+                    .setStyle(ButtonStyle.Danger),
+                new ButtonBuilder()
+                    .setCustomId('cancel_unlink_event_reward')
+                    .setLabel('Cancel')
+                    .setStyle(ButtonStyle.Secondary)
+            );
+        await interaction.reply({ embeds: [confirmEmbed], components: [row], ephemeral: true });
+
+    } else if (interaction.customId.startsWith('confirm_unlink_event_reward-')) {
+        const eventSpecificRewardId = interaction.customId.split('-')[1];
+        await interaction.deferUpdate();
+        try {
+            await linkStore.deleteEventReward(eventSpecificRewardId); // deleteEventReward uses the PK of event_rewards
+            await interaction.editReply({ content: 'Reward unlinked successfully.', embeds: [], components: [], ephemeral: true });
+        } catch (error) {
+            console.error(`Error unlinking event reward ${eventSpecificRewardId}:`, error);
+            await interaction.editReply({ content: 'An error occurred while unlinking the reward.', embeds: [], components: [], ephemeral: true });
+        }
+    } else if (interaction.customId === 'cancel_unlink_event_reward') {
+        await interaction.deferUpdate();
+        await interaction.editReply({ content: 'Unlinking reward cancelled.', embeds: [], components: [], ephemeral: true });
+
     } else if (interaction.customId === 'select_event_to_publish') {
       try {
         await interaction.deferUpdate(); // Acknowledge the select menu interaction
