@@ -1894,6 +1894,31 @@ client.on('interactionCreate', async interaction => {
     } else if (interaction.customId === 'cancel_clear_role') {
         await interaction.deferUpdate();
         await interaction.editReply({ content: 'Clearing role configuration cancelled.', components: [], embeds:[] });
+    } else if (interaction.customId === 'manual_user_link_btn') {
+        const { ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require('discord.js');
+        const modal = new ModalBuilder()
+            .setCustomId('manualUserLinkModal')
+            .setTitle('Manual User Link');
+
+        const discordUserInput = new TextInputBuilder()
+            .setCustomId('manualLinkDiscordInput')
+            .setLabel("Discord User (ID or Mention)")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setPlaceholder('e.g., @username or 123456789012345678');
+
+        const robloxUserInput = new TextInputBuilder()
+            .setCustomId('manualLinkRobloxInput')
+            .setLabel("Roblox ID or Username")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true)
+            .setPlaceholder('e.g., 123456 or RobloxUsername');
+
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(discordUserInput),
+            new ActionRowBuilder().addComponents(robloxUserInput)
+        );
+        await interaction.showModal(modal);
     }
   } else if (interaction.isModalSubmit()) {
     if (interaction.customId === 'addBotModModal') {
@@ -1974,6 +1999,81 @@ client.on('interactionCreate', async interaction => {
             await interaction.editReply({ content: `Could not revoke moderator status from ${targetUser.tag}. Please check logs.`});
         }
 
+    } else if (interaction.customId === 'manualUserLinkModal') {
+        await interaction.deferReply({ ephemeral: true });
+        const discordInput = interaction.fields.getTextInputValue('manualLinkDiscordInput');
+        const robloxInput = interaction.fields.getTextInputValue('manualLinkRobloxInput');
+        const { EmbedBuilder } = require('discord.js');
+        const { resolveRobloxId } = require('../utils/robloxUtils.js');
+
+        let targetDiscordUser;
+
+        const discordIdMatch = discordInput.match(/^<@!?(\d+)>$/) || discordInput.match(/^(\d+)$/);
+        if (discordIdMatch) {
+            try {
+                targetDiscordUser = await client.users.fetch(discordIdMatch[1]);
+            } catch (e) {
+                return interaction.editReply({ content: `Could not find Discord user: ${discordInput}.`, ephemeral: true });
+            }
+        } else {
+            return interaction.editReply({ content: 'Invalid Discord user input. Use ID or Mention.', ephemeral: true });
+        }
+
+        let verifiedRoleIdToAssign = process.env.VERIFIED_ROLE_ID;
+        // GUILD_ID is a top-level const from process.env
+        if (linkStore && typeof linkStore.getRoleConfig === 'function' && GUILD_ID) {
+            try {
+                const dbRoleConf = await linkStore.getRoleConfig(GUILD_ID, 'VERIFIED_ROLE');
+                if (dbRoleConf && dbRoleConf.role_id) {
+                    verifiedRoleIdToAssign = dbRoleConf.role_id;
+                }
+            } catch (e) { warn(`ManualLink(Manage): DB VERIFIED_ROLE fetch error: ${e.message}`); }
+        }
+
+        try {
+            const robloxId = await resolveRobloxId(robloxInput);
+
+            const existingDiscordLink = await linkStore.get(targetDiscordUser.id);
+            if (existingDiscordLink && existingDiscordLink.verified) {
+                return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Already Linked').setDescription(`Discord user ${targetDiscordUser.tag} is already linked to Roblox ID \`${existingDiscordLink.roblox}\`.`)] });
+            }
+
+            const existingRobloxLink = await linkStore.getByRb(robloxId);
+            if (existingRobloxLink && existingRobloxLink.discord !== targetDiscordUser.id && existingRobloxLink.verified) {
+                return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xFFC107).setTitle('⚠️ Roblox Account In Use').setDescription(`Roblox ID \`${robloxId}\` is already linked to <@${existingRobloxLink.discord}>.`)] });
+            }
+
+            const linkData = {
+                discord: targetDiscordUser.id, roblox: robloxId,
+                code: 'MANUALLY_LINKED_BY_ADMIN_VIA_MANAGE', verified: 1,
+                attempts: 0, lastAttempt: 0, created: Math.floor(Date.now() / 1000),
+            };
+            await linkStore.upsert(linkData);
+            // await linkStore.verify(targetDiscordUser.id); // Upsert with verified:1 should cover this
+
+            let roleAssignedInfo = 'No verified role configured or error assigning.';
+            if (verifiedRoleIdToAssign && GUILD_ID) {
+                try {
+                    const guild = await client.guilds.fetch(GUILD_ID);
+                    const member = await guild.members.fetch(targetDiscordUser.id);
+                    await member.roles.add(verifiedRoleIdToAssign);
+                    roleAssignedInfo = `The <@&${verifiedRoleIdToAssign}> role has been assigned.`;
+                } catch (roleError) {
+                    console.error(`ManualLink(Manage): Role assign error ${verifiedRoleIdToAssign} to ${targetDiscordUser.id}:`, roleError.message);
+                    roleAssignedInfo = `Failed to assign <@&${verifiedRoleIdToAssign}>. Check bot permissions/hierarchy.`;
+                }
+            }
+
+            await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0x4CAF50).setTitle('✅ Manual Link Successful').setDescription(`Linked ${targetDiscordUser.tag} to Roblox ID \`${robloxId}\`.\n${roleAssignedInfo}`)] });
+
+            try {
+                await targetDiscordUser.send({ embeds: [new EmbedBuilder().setColor(0x00BCD4).setTitle('🔗 Account Linked by Admin').setDescription(`An admin linked your Discord to Roblox ID \`${robloxId}\`.\n${roleAssignedInfo.includes("Failed") ? "Role assignment issue, contact admin." : ""}`)] });
+            } catch (dmError) { warn(`ManualLink(Manage): Could not DM ${targetDiscordUser.id}.`); }
+
+        } catch (error) {
+            console.error('ManualLink(Manage) error:', error);
+            await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xE53935).setTitle('❌ Manual Link Failed').setDescription(error.message || 'An unexpected error.')] });
+        }
     // The 'setRsvpRoleModal' handler was here. It has been removed as it's obsolete.
     // Modals for add/remove bot mod are handled above.
     // Next modal is editGlobalRewardTypeModal.
