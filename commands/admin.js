@@ -62,9 +62,24 @@ module.exports = {
 
       const targetUser = interaction.options.getUser('discorduser');
       const robloxInput = interaction.options.getString('robloxid_or_username');
-      const { VERIFIED_ROLE_ID, GUILD_ID } = envConfig;
+      // Use GUILD_ID from envConfig, VERIFIED_ROLE_ID will be fetched or fallback to env
+      const { GUILD_ID } = envConfig;
+      let verifiedRoleIdToAssign = envConfig.VERIFIED_ROLE_ID; // Fallback to .env
 
       try {
+        // Attempt to get VERIFIED_ROLE from DB config
+        if (linkStore && typeof linkStore.getRoleConfig === 'function' && GUILD_ID) {
+            const dbRoleConf = await linkStore.getRoleConfig(GUILD_ID, 'VERIFIED_ROLE');
+            if (dbRoleConf && dbRoleConf.role_id) {
+                verifiedRoleIdToAssign = dbRoleConf.role_id;
+                console.log(`AdminLink: Using VERIFIED_ROLE from DB config: ${verifiedRoleIdToAssign}`);
+            } else {
+                console.log(`AdminLink: VERIFIED_ROLE not in DB, using .env fallback: ${verifiedRoleIdToAssign}`);
+            }
+        } else {
+            console.warn('AdminLink: linkStore or getRoleConfig not available, or GUILD_ID missing. Falling back to .env for VERIFIED_ROLE_ID.');
+        }
+
         const robloxId = await resolveRobloxId(robloxInput);
 
         // Check if Discord user is already linked
@@ -107,15 +122,15 @@ module.exports = {
 
         // Assign role
         let roleAssignedInfo = '';
-        if (VERIFIED_ROLE_ID && GUILD_ID) {
+        if (verifiedRoleIdToAssign && GUILD_ID) { // Use the potentially DB-configured role ID
           try {
             const guild = await interaction.client.guilds.fetch(GUILD_ID);
             const member = await guild.members.fetch(targetUser.id);
-            await member.roles.add(VERIFIED_ROLE_ID);
-            roleAssignedInfo = `The <@&${VERIFIED_ROLE_ID}> role has been assigned.`;
+            await member.roles.add(verifiedRoleIdToAssign);
+            roleAssignedInfo = `The <@&${verifiedRoleIdToAssign}> role has been assigned.`;
           } catch (roleError) {
-            console.error(`AdminLink: Failed to assign role to ${targetUser.id}:`, roleError);
-            roleAssignedInfo = `Failed to assign the verified role. Please check bot permissions.`;
+            console.error(`AdminLink: Failed to assign role ${verifiedRoleIdToAssign} to ${targetUser.id}:`, roleError);
+            roleAssignedInfo = `Failed to assign the verified role (<@&${verifiedRoleIdToAssign}>). Please check bot permissions.`;
           }
         }
 
